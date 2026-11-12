@@ -161,7 +161,9 @@ def calendar():
     Display calendar for the current month.
     Supports month/year navigation via query parameters.
     """
-    return redirect(url_for('calendar'))
+    # Serve the calendar directly. (Was: redirect(url_for('calendar')),
+    # which resolves to this same route -> infinite redirect loop.)
+    return calendar_view()
 
 
 # Calendar View - main route
