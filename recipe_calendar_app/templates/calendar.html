@@ -10,25 +10,34 @@
             padding: 0;
             box-sizing: border-box;
         }
+
+        /* ===== Whole-page scaling =====
+           Every size in this UI is rem-based, and the root font-size
+           grows fluidly with the viewport, so the entire page scales
+           continuously with screen size: compact baseline on a phone,
+           larger on a laptop, and even larger on a desktop monitor or 4K TV. */
+        html {
+            font-size: clamp(16px, 13px + 0.55vw, 22px); /* px on purpose: root scale anchor */
+        }
         
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             min-height: 100vh;
-            padding: 20px;
+            padding: 1.25rem;
         }
         
         .container {
-            max-width: 1200px;
+            max-width: 75rem;
             margin: 0 auto;
         }
         
         .header {
             background: white;
-            padding: 25px;
-            border-radius: 15px;
+            padding: 1.562rem;
+            border-radius: 0.938rem;
             box-shadow: 0 10px 30px rgba(0,0,0,0.2);
-            margin-bottom: 20px;
+            margin-bottom: 1.25rem;
             display: flex;
             justify-content: space-between;
             align-items: center;
@@ -36,15 +45,15 @@
         
         .header h1 {
             color: #333;
-            font-size: 2.5rem;
+            font-size: clamp(1.9rem, 1.2rem + 2vw, 3rem); /* fluid: scales with screen width */
             margin-bottom: 5px;
         }
 
         .user-info {
             display: flex;
             align-items: center;
-            gap: 20px;
-            margin-top: 8px;
+            gap: 1.25rem;
+            margin-top: 0.5rem;
         }
 
         .user-info .user-email {
@@ -54,8 +63,8 @@
         }
 
         .user-info .user-avatar {
-            width: 40px;
-            height: 40px;
+            width: 2.5rem;
+            height: 2.5rem;
             border-radius: 50%;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             display: flex;
@@ -69,13 +78,13 @@
 
         .clean-samples-link {
             display: inline-block;
-            margin-top: 10px;
+            margin-top: 0.625rem;
             font-size: 0.9rem;
             color: #999;
             text-decoration: none;
-            padding: 5px 12px;
+            padding: 0.312rem 0.75rem;
             background: rgba(0,0,0,0.05);
-            border-radius: 4px;
+            border-radius: 0.25rem;
             transition: all 0.2s;
         }
 
@@ -86,21 +95,21 @@
         
         .nav-buttons {
             display: flex;
-            gap: 10px;
+            gap: 0.625rem;
         }
         
         .nav-btn {
             background: #667eea;
             color: white;
             border: none;
-            padding: 12px 25px;
-            border-radius: 8px;
+            padding: 0.75rem 1.562rem;
+            border-radius: 0.5rem;
             cursor: pointer;
             font-size: 1.1rem;
             transition: all 0.3s;
             display: flex;
             align-items: center;
-            gap: 8px;
+            gap: 0.5rem;
         }
         
         .nav-btn:hover {
@@ -111,30 +120,30 @@
         
         .calendar-wrapper {
             background: white;
-            padding: 30px;
-            border-radius: 15px;
+            padding: 1.875rem;
+            border-radius: 0.938rem;
             box-shadow: 0 10px 30px rgba(0,0,0,0.2);
         }
         
         .calendar-grid {
             display: grid;
             grid-template-columns: repeat(7, 1fr);
-            gap: 10px;
+            gap: 0.625rem;
         }
         
         .day-header {
             text-align: center;
             font-weight: 600;
             color: #666;
-            padding: 15px;
+            padding: 0.938rem;
             background: #f8f9fa;
-            border-radius: 8px;
+            border-radius: 0.5rem;
         }
         
         .day-cell {
-            min-height: 120px;
-            padding: 10px;
-            border-radius: 8px;
+            min-height: 7.5rem;
+            padding: 0.625rem;
+            border-radius: 0.5rem;
             background: #f8f9fa;
             transition: all 0.3s;
             position: relative;
@@ -172,11 +181,11 @@
         .day-number {
             font-weight: 600;
             font-size: 1.1rem;
-            margin-bottom: 8px;
-            padding: 8px;
+            margin-bottom: 0.5rem;
+            padding: 0.5rem;
             background: #667eea;
             color: white;
-            border-radius: 5px;
+            border-radius: 0.312rem;
             text-align: center;
         }
         
@@ -191,9 +200,9 @@
         
         .recipe {
             background: white;
-            border-radius: 8px;
-            padding: 10px;
-            margin-bottom: 8px;
+            border-radius: 0.5rem;
+            padding: 0.625rem;
+            margin-bottom: 0.5rem;
             cursor: pointer;
             transition: all 0.3s;
             border-left: 4px solid #667eea;
@@ -208,22 +217,22 @@
         .recipe-title {
             font-weight: 600;
             color: #333;
-            margin-bottom: 5px;
+            margin-bottom: 0.312rem;
             font-size: 0.9rem;
         }
         
         .recipe-image {
             width: 100%;
-            height: 60px;
+            height: 3.75rem;
             object-fit: cover;
-            border-radius: 4px;
-            margin-top: 5px;
+            border-radius: 0.25rem;
+            margin-top: 0.312rem;
         }
         
         .no-recipes {
             text-align: center;
             color: #999;
-            padding: 20px;
+            padding: 1.25rem;
             font-style: italic;
         }
 
@@ -235,8 +244,8 @@
             color: white;
             border: none;
             border-radius: 50%;
-            width: 24px;
-            height: 24px;
+            width: 1.5rem;
+            height: 1.5rem;
             font-size: 0.7rem;
             font-weight: bold;
             cursor: pointer;
@@ -255,40 +264,87 @@
         
         .legend {
             display: flex;
-            gap: 20px;
-            margin-top: 20px;
-            padding: 15px;
+            gap: 1.25rem;
+            margin-top: 1.25rem;
+            padding: 0.938rem;
             background: #f8f9fa;
-            border-radius: 8px;
+            border-radius: 0.5rem;
         }
         
         .legend-item {
             display: flex;
             align-items: center;
-            gap: 8px;
+            gap: 0.5rem;
             font-size: 0.9rem;
             color: #666;
         }
         
         .legend-box {
-            width: 16px;
-            height: 16px;
-            border-radius: 3px;
+            width: 1rem;
+            height: 1rem;
+            border-radius: 0.188rem;
         }
         
-        @media (max-width: 768px) {
-            .calendar-grid {
-                grid-template-columns: repeat(7, 1fr);
-                font-size: 0.8rem;
+        /* Phone: switch the calendar from a 7-column grid to a vertical
+           list of days so every day and its recipes get the full
+           screen width instead of being crushed into ~45px cells */
+        @media (max-width: 640px) {
+            body { padding: 0.75rem; }
+
+            .header {
+                flex-direction: column;
+                align-items: stretch;
+                gap: 0.938rem;
+                padding: 1.125rem;
             }
-            
-            .day-cell {
-                min-height: 80px;
+
+            .user-info { justify-content: flex-start; flex-wrap: wrap; gap: 0.75rem; }
+            .nav-buttons { width: 100%; }
+            .nav-btn { flex: 1; justify-content: center; padding: 0.75rem 0.625rem; }
+
+            .calendar-wrapper { padding: 0.75rem; }
+            .calendar-grid { grid-template-columns: 1fr; gap: 0.625rem; }
+            .calendar-grid .day-header { display: none; }
+
+            .day-cell { min-height: 0; }
+            .day-number {
+                display: inline-block;
+                min-width: 2.75rem;
+                padding: 0.375rem 0.625rem;
+                margin-bottom: 0.625rem;
             }
-            
-            .header h1 {
-                font-size: 1.8rem;
+
+            /* Day-of-week label above each row. Days start at the 8th
+               child of the grid (the 7 weekday headers stay in the DOM,
+               hidden), so 7n+8 = Sunday, 7n+14 = Saturday. */
+            .day-cell::before {
+                display: block;
+                font-size: 0.7rem;
+                font-weight: 700;
+                text-transform: uppercase;
+                letter-spacing: 1.5px;
+                color: #999;
+                margin-bottom: 0.25rem;
             }
+            .day-cell:nth-child(7n+8)::before  { content: "Sun"; }
+            .day-cell:nth-child(7n+9)::before  { content: "Mon"; }
+            .day-cell:nth-child(7n+10)::before { content: "Tue"; }
+            .day-cell:nth-child(7n+11)::before { content: "Wed"; }
+            .day-cell:nth-child(7n+12)::before { content: "Thu"; }
+            .day-cell:nth-child(7n+13)::before { content: "Fri"; }
+            .day-cell:nth-child(7n+14)::before { content: "Sat"; }
+
+            .no-recipes { padding: 0.25rem 0 0.5rem; }
+            .recipe-image { height: 5.625rem; }
+            .legend { flex-wrap: wrap; gap: 0.625rem; padding: 0.625rem; }
+        }
+
+        /* Tablet: keep the 7-column grid but tighten paddings/gaps */
+        @media (min-width: 641px) and (max-width: 900px) {
+            .header h1 { font-size: 2rem; }
+            .calendar-wrapper { padding: 1rem; }
+            .calendar-grid { gap: 0.375rem; }
+            .day-cell { min-height: 6.25rem; padding: 0.5rem; }
         }
     </style>
 </head>
@@ -299,7 +355,7 @@
             <div class="user-info">
                 <div class="user-avatar">{{ user_email[:2]|upper }}</div>
                 <div class="user-email">{{ user_email or 'Guest' }}</div>
-                <a href="/logout" style="text-decoration: none; color: #667eea; font-size: 0.9rem; font-weight: 600; padding: 8px 15px; border-radius: 6px; transition: all 0.2s;">Logout</a>
+                <a href="/logout" style="text-decoration: none; color: #667eea; font-size: 0.9rem; font-weight: 600; padding: 0.5rem 0.938rem; border-radius: 0.375rem; transition: all 0.2s;">Logout</a>
             </div>
             <a href="/clean-samples" class="clean-samples-link" title="Remove sample recipes">🗑️ Clean Samples</a>
             <div class="nav-buttons">
