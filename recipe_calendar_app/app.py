@@ -13,7 +13,9 @@ app.secret_key = os.urandom(24)  # Secure random secret key for sessions
 # Use Render's Postgres when DATABASE_URL is set; fall back to local SQLite
 _db_url = os.environ.get('DATABASE_URL', 'sqlite:///calendar.db')
 if _db_url.startswith('postgres://'):
-    _db_url = _db_url.replace('postgres://', 'postgresql+psycopg://', 1)
+    _db_url = 'postgresql+psycopg://' + _db_url[len('postgres://'):]
+elif _db_url.startswith('postgresql://'):
+    _db_url = 'postgresql+psycopg://' + _db_url[len('postgresql://'):]
 app.config['SQLALCHEMY_DATABASE_URI'] = _db_url
 app.config['SQLALCHEMY_TRACK_CHANGES'] = False
 @app.route('/login', methods=['GET', 'POST'])
