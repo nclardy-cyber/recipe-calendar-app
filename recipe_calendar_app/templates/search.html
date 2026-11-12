@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Recipe Search - {{ query or 'Recipe Calendar' }}</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1000px;
+            margin: 0 auto;
+        }
+        
+        .header {
+            background: white;
+            padding: 25px;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            margin-bottom: 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 15px;
+        }
+        
+        .header h1 {
+            color: #333;
+            font-size: 2rem;
+            margin-bottom: 5px;
+        }
+        
+        .header .calendar-link {
+            text-decoration: none;
+            color: #667eea;
+            font-weight: 600;
+            font-size: 0.9rem;
+            padding: 8px 16px;
+            background: #f8f9fa;
+            border-radius: 6px;
+            transition: all 0.3s;
+        }
+        
+        .header .calendar-link:hover {
+            background: #e9ecef;
+        }
+        
+        .search-form {
+            background: white;
+            padding: 25px;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            margin-bottom: 20px;
+        }
+        
+        .search-form h2 {
+            color: #333;
+            margin-bottom: 15px;
+            font-size: 1.5rem;
+        }
+        
+        .search-input-group {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        
+        .search-input-group input {
+            flex: 1;
+            min-width: 250px;
+            padding: 15px;
+            border: 2px solid #e9ecef;
+            border-radius: 10px;
+            font-size: 1rem;
+            transition: border 0.3s;
+        }
+        
+        .search-input-group input:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        
+        .search-input-group label {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 12px 16px;
+            background: #f8f9fa;
+            border: 2px solid #e9ecef;
+            border-radius: 10px;
+            cursor: pointer;
+            font-size: 0.95rem;
+            color: #555;
+            transition: all 0.3s;
+        }
+        
+        .search-input-group label:hover {
+            background: #e9ecef;
+        }
+        
+        .search-input-group label input[type="radio"] {
+            width: 18px;
+            height: 18px;
+        }
+        
+        .search-btn {
+            background: #667eea;
+            color: white;
+            border: none;
+            padding: 15px 30px;
+            border-radius: 10px;
+            cursor: pointer;
+            font-size: 1rem;
+            font-weight: 600;
+            transition: all 0.3s;
+            white-space: nowrap;
+        }
+        
+        .search-btn:hover {
+            background: #764ba2;
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+        }
+        
+        .sources-info {
+            margin-top: 15px;
+            padding: 15px;
+            background: #f8f9fa;
+            border-radius: 8px;
+            color: #666;
+            font-size: 0.9rem;
+        }
+        
+        .results-section {
+            background: white;
+            padding: 30px;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+        }
+        
+        .results-section h2 {
+            color: #333;
+            margin-bottom: 20px;
+            font-size: 1.5rem;
+        }
+        
+        .result-item {
+            border: 1px solid #e9ecef;
+            border-radius: 10px;
+            padding: 20px;
+            margin-bottom: 20px;
+            background: #fafafa;
+        }
+        
+        .result-item h3 {
+            color: #667eea;
+            margin-bottom: 10px;
+            font-size: 1.2rem;
+        }
+        
+        .result-item .source-name {
+            color: #888;
+            font-size: 0.9rem;
+            margin-bottom: 10px;
+        }
+        
+        .result-item .url {
+            color: #667eea;
+            font-size: 0.9rem;
+            margin-bottom: 10px;
+        }
+        
+        .result-item .content {
+            color: #555;
+            line-height: 1.6;
+            font-size: 0.95rem;
+        }
+        
+        .empty-results {
+            text-align: center;
+            padding: 40px;
+            color: #999;
+        }
+        
+        .empty-results-icon {
+            font-size: 4rem;
+            margin-bottom: 15px;
+        }
+        
+        .empty-results h3 {
+            font-size: 1.5rem;
+            color: #666;
+            margin-bottom: 10px;
+        }
+        
+        .empty-results p {
+            font-size: 1rem;
+            color: #888;
+        }
+        
+        .back-to-day {
+            display: inline-block;
+            margin-top: 15px;
+            color: #667eea;
+            text-decoration: none;
+            font-weight: 600;
+        }
+        
+        .back-to-day:hover {
+            text-decoration: underline;
+        }
+        
+        @media (max-width: 768px) {
+            .header {
+                flex-direction: column;
+                gap: 15px;
+                text-align: center;
+            }
+            
+            .search-input-group {
+                flex-direction: column;
+            }
+            
+            .search-input-group input {
+                min-width: 100%;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>
+                {% if query %}
+                    {{ query|truncate(50) }} - Search Results
+                {% else %}
+                    Recipe Calendar Search
+                {% endif %}
+            </h1>
+            <a href="{{ query and '/day/' + (query|replace(' ', '-')) or '' }}" class="calendar-link">
+                {% if query %}Back to Day{% else %}Back to Calendar{% endif %}
+            </a>
+        </div>
+        
+        <div class="search-form">
+            <h2>Search for Recipes</h2>
+            
+            <form method="GET" action="/search" class="search-input-group">
+                <div style="flex: 1; min-width: 250px;">
+                    <input 
+                        type="text" 
+                        name="q" 
+                        value="{{ query }}" 
+                        placeholder="What would you like to cook?"
+                        autofocus>
+                </div>
+                
+                <label style="flex: 1; min-width: 200px; min-height: 42px; display: flex; align-items: center;">
+                    <input 
+                        type="radio" 
+                        name="source" 
+                        value="all" 
+                        {% if not source %}checked{% endif %}>
+                    <span>Search All Sources</span>
+                </label>
+                
+                <label style="flex: 1; min-width: 200px; min-height: 42px; display: flex; align-items: center;">
+                    <input 
+                        type="radio" 
+                        name="source" 
+                        value="foodnetwork">
+                    <span>Food Network Only</span>
+                </label>
+                
+                <label style="flex: 1; min-width: 200px; min-height: 42px; display: flex; align-items: center;">
+                    <input 
+                        type="radio" 
+                        name="source" 
+                        value="recipetineats">
+                    <span>Recipe Tin Eats Only</span>
+                </label>
+                
+                <button type="submit" class="search-btn">
+                    🔍 Search Recipes
+                </button>
+            </form>
+            
+            <div class="sources-info">
+                <strong>Search Sources:</strong>
+                <br>• AllRecipes.com (Recipe database)
+                <br>• FoodNetwork.com/Recipes (TV show recipes)
+                <br>• RecipeTinEats.com (Quick & easy recipes)
+            </div>
+        </div>
+        
+        {% if results %}
+        <div class="results-section">
+            <h2>Search Results for "{{ query }}"</h2>
+            
+            {% for result in results %}
+            <div class="result-item">
+                <h3>{{ result.source }} Results</h3>
+                <div class="source-name">URL: {{ result.url }}</div>
+                <div class="content">{{ result.content[:500] }}{% if result.content|length > 500 %}...{% endif %}</div>
+                <a href="{{ result.url }}" target="_blank" class="back-to-day">View Full Results →</a>
+            </div>
+            {% endfor %}
+        </div>
+        {% else %}
+        <div class="results-section">
+            <div class="empty-results">
+                <div class="empty-results-icon">🔍</div>
+                <h3>No search results found</h3>
+                <p>Try searching for a different term, or browse the calendar first to see your saved recipes.</p>
+                <a href="{{ query and '/day/' + (query|replace(' ', '-')) or '' }}" class="back-to-day">
+                    {% if query %}Back to Day{% else %}Back to Calendar{% endif %}
+                </a>
+            </div>
+        </div>
+        {% endif %}
+    </div>
+</body>
+</html>
