@@ -5,6 +5,9 @@ Simple calendar view with month navigation
 
 from flask import Flask, render_template, request, redirect, url_for, session, flash
 from flask_sqlalchemy import SQLAlchemy
+from flask_login import LoginManager, UserMixin
+from flask_migrate import Migrate
+from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime, timedelta, date
 from calendar import monthrange, month_name
 import logging
@@ -114,6 +117,51 @@ def logout():
 app.config['SQLALCHEMY_TRACK_CHANGES'] = False
 
 db = SQLAlchemy(app)
+migrate = Migrate(app, db)
+
+
+def normalize_email(email) -> str:
+    """Normalize an email address for storage and lookup.
+
+    Strips surrounding whitespace and lowercases, so ' User@Example.COM '
+    and 'user@example.com' resolve to the same account.
+    """
+    return (email or '').strip().lower()
+
+
+class User(db.Model, UserMixin):
+    """Public multi-user account.
+
+    - ``email`` is unique and always stored in normalized form.
+    - ``password_hash`` holds a salted Werkzeug password hash (scrypt by
+      default); plaintext passwords are never stored.
+    - ``created_at`` is the account creation timestamp (DB-side default).
+    - ``email_verified`` / ``status`` track verification and lifecycle.
+      Valid ``status`` values: 'active', 'pending_verification', 'disabled'.
+    """
+    __tablename__ = 'user'
+
+    id = db.Column(db.Integer, primary_key=True)
+    email = db.Column(db.String(255), unique=True, nullable=False)
+    password_hash = db.Column(db.String(256), nullable=False)
+    created_at = db.Column(db.DateTime, nullable=False,
+                           server_default=db.func.now())
+    email_verified = db.Column(db.Boolean, nullable=False,
+                               server_default=db.false())
+    status = db.Column(db.String(20), nullable=False,
+                       server_default='active', default='active')
+
+    def __init__(self, email=None, **kwargs):
+        if email is not None:
+            email = normalize_email(email)
+        super().__init__(email=email, **kwargs)
+
+    def set_password(self, password: str) -> None:
+        self.password_hash = generate_password_hash(password)
+
+    def check_password(self, password: str) -> bool:
+        return check_password_hash(self.password_hash, password)
+
 
 # Calendar Model
 class Recipe(db.Model):
@@ -122,12 +170,21 @@ class Recipe(db.Model):
     image = db.Column(db.String(200))
     date = db.Column(db.Date)
     description = db.Column(db.Text)
+    # Nullable ownership: NULL means a legacy/shared recipe that belongs to
+    # no account. Legacy rows must NEVER be assigned to an arbitrary user.
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+    user = db.relationship('User')
 
-# User Model for Authentication  # Disabled for now
-# class User(db.Model):
-#     id = db.Column(db.Integer, primary_key=True)
-#     email = db.Column(db.String(120), unique=True, nullable=False)
-#     password = db.Column(db.String(120), unique=True, nullable=False)
+
+# Flask-Login wiring (foundation; endpoint rework lands in CMP-004)
+login_manager = LoginManager(app)
+login_manager.login_view = 'login'
+
+
+@login_manager.user_loader
+def load_user(user_id):
+    return db.session.get(User, int(user_id))
+
 
 # Initialize database (idempotent, safe on every boot)
 try:
