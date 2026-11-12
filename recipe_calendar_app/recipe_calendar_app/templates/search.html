@@ -188,6 +188,27 @@
             font-size: 0.95rem;
         }
         
+                .result-list {
+            list-style: none;
+            margin-bottom: 12px;
+        }
+        
+        .result-list li {
+            padding: 6px 0;
+            border-bottom: 1px solid #f0f0f0;
+            font-size: 0.95rem;
+        }
+        
+        .result-list a {
+            color: #667eea;
+            text-decoration: none;
+            font-weight: 500;
+        }
+        
+        .result-list a:hover {
+            text-decoration: underline;
+        }
+        
         .empty-results {
             text-align: center;
             padding: 40px;
@@ -249,9 +270,7 @@
                     Recipe Calendar Search
                 {% endif %}
             </h1>
-            <a href="{{ query and '/day/' + (query|replace(' ', '-')) or '' }}" class="calendar-link">
-                {% if query %}Back to Day{% else %}Back to Calendar{% endif %}
-            </a>
+            <a href="/calendar" class="calendar-link">Back to Calendar</a>
         </div>
         
         <div class="search-form">
@@ -313,7 +332,16 @@
             <div class="result-item">
                 <h3>{{ result.source }} Results</h3>
                 <div class="source-name">URL: {{ result.url }}</div>
-                <div class="content">{{ result.content[:500] }}{% if result.content|length > 500 %}...{% endif %}</div>
+                {% if result['items'] %}
+                <ul class="result-list">
+                    {% for item in result['items'] %}
+                    <li><a href="{{ item.url }}" target="_blank">{{ item.title }}</a></li>
+                    {% endfor %}
+                </ul>
+                {% endif %}
+                {% if result.message %}
+                <div class="content">{{ result.message }}</div>
+                {% endif %}
                 <a href="{{ result.url }}" target="_blank" class="back-to-day">View Full Results →</a>
             </div>
             {% endfor %}
@@ -324,9 +352,7 @@
                 <div class="empty-results-icon">🔍</div>
                 <h3>No search results found</h3>
                 <p>Try searching for a different term, or browse the calendar first to see your saved recipes.</p>
-                <a href="{{ query and '/day/' + (query|replace(' ', '-')) or '' }}" class="back-to-day">
-                    {% if query %}Back to Day{% else %}Back to Calendar{% endif %}
-                </a>
+                <a href="/calendar" class="back-to-day">Back to Calendar</a>
             </div>
         </div>
         {% endif %}

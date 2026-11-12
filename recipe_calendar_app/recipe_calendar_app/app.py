@@ -411,69 +411,98 @@ def day_view(day_num):
 # Recipe API endpoints
 
 # Search Routes - Search across three recipe websites
+import re as _re
+import requests
+from urllib.parse import quote_plus
+
+SEARCH_SOURCES = [
+    {
+        'key': 'allrecipes',
+        'name': 'AllRecipes',
+        'url_template': 'https://www.allrecipes.com/search?q={}',
+        'scrape': False,  # JS-rendered page + bot protection: link-only
+    },
+    {
+        'key': 'foodnetwork',
+        'name': 'Food Network',
+        'url_template': 'https://www.foodnetwork.com/search/{}',
+        'scrape': False,  # blocks server requests: link-only
+    },
+    {
+        'key': 'recipetineats',
+        'name': 'Recipe Tin Eats',
+        'url_template': 'https://www.recipetineats.com/search/{}',
+        'scrape': True,
+    },
+]
+
+_SEARCH_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+}
+
+
+def _extract_recipetineats(html_text):
+    """Extract (title, url) pairs from a Recipe Tin Eats search results page."""
+    pattern = _re.compile(
+        r'<article[^>]*aria-label="([^"]+)"[^>]*>.*?'
+        r'href="(https://www\.recipetineats\.com/[^"]+)"',
+        _re.S,
+    )
+    seen = set()
+    items = []
+    for title, url in pattern.findall(html_text):
+        if url in seen:
+            continue
+        seen.add(url)
+        items.append({'title': title, 'url': url})
+    return items
+
+
 @app.route('/search')
 def search():
-    """Search recipes across multiple websites"""
+    """Search recipes across multiple websites."""
     query = request.args.get('q', '').strip()
     source = request.args.get('source', '').strip()
-    
+
     results = []
-    
+
     if not query:
         # Show search form
-        sources = [
-            ('all', 'All Sources', 'https://www.allrecipes.com/search?q={}'.format(query)),
-            ('foodnetwork', 'Food Network', 'https://www.foodnetwork.com/recipes/search?q={}'.format(query)),
-            ('recipetineats', 'Recipe Tin Eats', 'https://www.recipetineats.com/search?q={}'.format(query))
-        ]
-        return render_template('search.html', query=query, sources=sources, results=results)
-    
-    # Search each source
-    if source == 'all' or not source:
-        # Search all sources
-        for src, name, base_url in sources:
-            search_url = base_url.format(query)
-            try:
-                from hermes_tools import web_extract
-                page = web_extract([search_url])
-                results.append({
-                    'source': name,
-                    'url': search_url,
-                    'content': page[0].get('content', '') if page else ''
-                })
-            except Exception as e:
-                results.append({
-                    'source': name,
-                    'url': search_url,
-                    'content': f'Error: {str(e)}'
-                })
-    
+        return render_template('search.html', query=query, source=source, results=results)
+
+    encoded_query = quote_plus(query)
+
+    if not source or source == 'all':
+        selected = SEARCH_SOURCES
     else:
-        # Search specific source
-        search_map = {
-            'allrecipes': 'https://www.allrecipes.com/search?q={}',
-            'foodnetwork': 'https://www.foodnetwork.com/recipes/search?q={}',
-            'recipetineats': 'https://www.recipetineats.com/search?q={}'
-        }
-        
-        if source in search_map:
-            search_url = search_map[source].format(query)
+        selected = [s for s in SEARCH_SOURCES if s['key'] == source] or list(SEARCH_SOURCES)
+
+    for src in selected:
+        search_url = src['url_template'].format(encoded_query)
+        items = []
+        message = ''
+        if src['scrape']:
             try:
-                from hermes_tools import web_extract
-                page = web_extract([search_url])
-                results.append({
-                    'source': search_map[source].split('q={}')[0].split('=')[1],
-                    'url': search_url,
-                    'content': page[0].get('content', '') if page else ''
-                })
-            except Exception as e:
-                results.append({
-                    'source': search_map[source].split('q={}')[0].split('=')[1],
-                    'url': search_url,
-                    'content': f'Error: {str(e)}'
-                })
-    
-    return render_template('search.html', query=query, sources=sources, results=results)
+                resp = requests.get(search_url, headers=_SEARCH_HEADERS, timeout=15)
+                resp.raise_for_status()
+                items = _extract_recipetineats(resp.text)[:10]
+                if not items:
+                    message = 'No recipes matched this query on this site.'
+            except Exception as exc:
+                message = 'Could not fetch results ({}). Use the link below to search directly.'.format(exc.__class__.__name__)
+        else:
+            message = 'This site blocks automated access, so use the link below to browse its results.'
+        results.append({
+            'source': src['name'],
+            'url': search_url,
+            'items': items,
+            'message': message,
+        })
+
+    return render_template('search.html', query=query, source=source, results=results)
+
 
 
 # Start the development server
