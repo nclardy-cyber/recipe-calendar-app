@@ -68,4 +68,7 @@ def downgrade():
     for name, _coltype in reversed(TOKEN_COLUMNS):
         if name in existing:
             # Column names above are fixed literals — no interpolation risk.
-            op.execute('ALTER TABLE user DROP COLUMN ' + name)
+            # The table name must be quoted: ``user`` is a PostgreSQL
+            # reserved word and unquoted DDL on it fails on PG (it only
+            # works silently on SQLite).
+            op.execute('ALTER TABLE "user" DROP COLUMN ' + name)

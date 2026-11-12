@@ -57,8 +57,12 @@ def upgrade() -> None:
                       nullable=False),
             sa.Column('email_verified', sa.Boolean(),
                       server_default=sa.false(), nullable=False),
+            # Plain-string server default (matches the model): SQLAlchemy
+            # renders it as ``DEFAULT 'active'`` — the string is quoted,
+            # which PostgreSQL requires. (``sa.text('active')`` rendered the
+            # unquoted ``DEFAULT active`` that PostgreSQL rejects.)
             sa.Column('status', sa.String(length=20),
-                      server_default=sa.text('active'), nullable=False),
+                      server_default='active', nullable=False),
             sa.PrimaryKeyConstraint('id'),
         )
         op.create_index(op.f('ix_user_email'), 'user', ['email'],
