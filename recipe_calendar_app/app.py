@@ -5,11 +5,51 @@ Simple calendar view with month navigation
 
 from flask import Flask, render_template, request, redirect, url_for, session, flash
 from flask_sqlalchemy import SQLAlchemy
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
+from calendar import monthrange, month_name
+import logging
 import os
 
+logger = logging.getLogger(__name__)
+
+# --- Security configuration --------------------------------------------------
+# SECRET_KEY is read from the environment. It is NEVER generated randomly on
+# startup (that invalidates all sessions on every restart) and is never logged.
+# Production: a missing SECRET_KEY aborts startup. Development: a fixed,
+# clearly-marked fallback key is used so local sessions survive restarts.
+DEV_FALLBACK_SECRET_KEY = 'dev-only-insecure-secret-key-change-me'
+_PRODUCTION_ENVS = {'production', 'prod'}
+
+
+def _is_production() -> bool:
+    return os.environ.get('FLASK_ENV', '').strip().lower() in _PRODUCTION_ENVS
+
+
+def _resolve_secret_key() -> str:
+    key = os.environ.get('SECRET_KEY', '').strip()
+    if key:
+        return key
+    if _is_production():
+        raise RuntimeError(
+            'SECRET_KEY environment variable is required in production. '
+            'Generate one with: '
+            'python -c "import secrets; print(secrets.token_urlsafe(32))"'
+        )
+    logger.warning(
+        'SECRET_KEY not set - using the insecure development fallback key. '
+        'Set SECRET_KEY before deploying.'
+    )
+    return DEV_FALLBACK_SECRET_KEY
+
+
 app = Flask(__name__)
-app.secret_key = os.urandom(24)  # Secure random secret key for sessions
+app.secret_key = _resolve_secret_key()
+# Debug mode is OFF by default, so the Werkzeug debugger never runs. Only the
+# local dev server may enable it via FLASK_DEBUG=1; gunicorn does not run the
+# Werkzeug dev server, so the debugger cannot start under it.
+app.debug = os.environ.get('FLASK_DEBUG', '').strip().lower() in {'1', 'true', 'yes'}
+app.config['DEBUG'] = app.debug
+
 # Use Render's Postgres when DATABASE_URL is set; fall back to local SQLite
 _db_url = os.environ.get('DATABASE_URL', 'sqlite:///calendar.db')
 if _db_url.startswith('postgres://'):
@@ -176,80 +216,63 @@ def calendar_view():
     # Get month and year from query params, default to current
     month = request.args.get('month')
     year = request.args.get('year')
-    
+
     if month is None or year is None:
         now = datetime.now()
-        month = str(now.month).zfill(2)
-        year = str(now.year)
+        month_i, year_i = now.month, now.year
     else:
-        month = str(month).zfill(2)
-        year = str(year)
-    
-    # Calculate days in current month
-    try:
-        last_day = datetime(int(year), int(month), 28).strftime('%Y-%m-%d')
-        last_day = datetime.strptime(last_day, '%Y-%m-%d')
-        days_in_month = last_day.day
-    except:
-        days_in_month = 30
-    
-    # Calculate first day of month (0=Monday, 6=Sunday)
-    first_day = datetime(int(year), int(month), 1).strftime('%Y-%m-%d')
-    first_day = datetime.strptime(first_day, '%Y-%m-%d')
-    start_day = first_day.weekday()
-    
+        try:
+            month_i, year_i = int(month), int(year)
+        except ValueError:
+            now = datetime.now()
+            month_i, year_i = now.month, now.year
+    if not (1 <= month_i <= 12 and 1 <= year_i <= 9999):
+        now = datetime.now()
+        month_i, year_i = now.month, now.year
+    month = str(month_i).zfill(2)
+    year = str(year_i)
+
+    # Days in the displayed month - monthrange handles leap years (Feb 2024 = 29)
+    days_in_month = monthrange(year_i, month_i)[1]
+
+    # First weekday of the month (0=Monday, 6=Sunday) and the adjacent months
+    start_day = date(year_i, month_i, 1).weekday()
+    if month_i == 1:
+        prev_month_i, prev_year_i = 12, year_i - 1
+    else:
+        prev_month_i, prev_year_i = month_i - 1, year_i
+    if month_i == 12:
+        next_month_i, next_year_i = 1, year_i + 1
+    else:
+        next_month_i, next_year_i = month_i + 1, year_i
+    prev_month_days = monthrange(prev_year_i, prev_month_i)[1]
+
     # Generate calendar grid
     calendar_days = []
     for i in range(42):  # 6 weeks max
         day_num = i - start_day + 1
         if day_num <= 0:
-            # Previous month
-            prev_month = int(month) - 1
-            if prev_month < 1:
-                prev_month = 12
-                prev_year = int(year) - 1
-            else:
-                prev_year = int(year)
-            prev_month = str(prev_month).zfill(2)
-            try:
-                day_date = datetime(prev_year, prev_month, 28).strftime('%Y-%m-%d')
-                day_date = datetime.strptime(day_date, '%Y-%m-%d')
-                day_num = day_date.day
-            except:
-                day_num = 28
+            # Leading cells: real dates from the previous month (e.g. 30, 31)
+            d = prev_month_days + day_num  # day_num is negative
             calendar_days.append({
-                'day': day_num,
-                'day_str': str(day_num).zfill(2),
+                'day': d,
+                'day_str': str(d).zfill(2),
                 'is_current_month': False,
                 'day_class': 'prev-month'
             })
         elif day_num > days_in_month:
-            # Next month
-            next_month = int(month) + 1
-            if next_month > 12:
-                next_month = 1
-                next_year = int(year) + 1
-            else:
-                next_year = int(year)
-            next_month = str(next_month).zfill(2)
-            try:
-                day_date = datetime(next_year, next_month, 28).strftime('%Y-%m-%d')
-                day_date = datetime.strptime(day_date, '%Y-%m-%d')
-                day_num = day_date.day
-            except:
-                day_num = 28
+            # Trailing cells: real dates from the next month (1, 2, 3, ...)
+            d = day_num - days_in_month
             calendar_days.append({
-                'day': day_num,
-                'day_str': str(day_num).zfill(2),
+                'day': d,
+                'day_str': str(d).zfill(2),
                 'is_current_month': False,
                 'day_class': 'next-month'
             })
         else:
-            # Current month
-            day_date = datetime(int(year), int(month), day_num)
-            # Convert to date object for consistent query
-            day_date_date = day_date.date()
-            recipes = Recipe.query.filter_by(date=day_date_date).all()
+            # Current month - always a valid current-month date
+            day_date = date(year_i, month_i, day_num)
+            recipes = Recipe.query.filter_by(date=day_date).all()
             # Serialize recipes for template
             calendar_days.append({
                 'day': day_num,
@@ -266,31 +289,15 @@ def calendar_view():
                     for r in recipes
                 ]
             })
-    
-    # Get navigation buttons
-    prev_month = int(month) - 1
-    next_month = int(month) + 1
-    prev_year = int(year)
-    next_year = int(year)
-    
-    if prev_month < 1:
-        prev_month = 12
-        prev_year -= 1
-    else:
-        prev_month = str(prev_month).zfill(2)
-    
-    if next_month > 12:
-        next_month = 1
-        next_year += 1
-    else:
-        next_month = str(next_month).zfill(2)
-    
-    prev_month_url = f'?month={prev_month}&year={prev_year}'
-    next_month_url = f'?month={next_month}&year={next_year}'
-    
+
+    # Navigation URLs (year boundaries wrap correctly)
+    prev_month_url = (f'?month=12&year={year_i - 1}' if month_i == 1
+                      else f'?month={str(month_i - 1).zfill(2)}&year={year_i}')
+    next_month_url = (f'?month=01&year={year_i + 1}' if month_i == 12
+                      else f'?month={str(month_i + 1).zfill(2)}&year={year_i}')
+
     # Month name for display
-    from calendar import month_name
-    month_name_display = month_name[int(month)]
+    month_name_display = month_name[month_i]
     
     return render_template('calendar.html',
                          days=calendar_days,
@@ -381,30 +388,32 @@ def day_view(day_num):
     month = request.args.get('month')
     year = request.args.get('year')
     search_query = request.args.get('search', '').strip()  # Capture search query
-    
-    # Get days in this month for navigation
-    try:
-        last_day = datetime(int(year), int(month), 28)
-        days_in_month = last_day.day
-    except:
-        days_in_month = 30
-    
+
+    # Resolve month/year FIRST (default to current month), then compute length
     if month is None or year is None:
         now = datetime.now()
-        month = str(now.month).zfill(2)
-        year = str(now.year)
+        month_i, year_i = now.month, now.year
     else:
-        month = str(month).zfill(2)
-        year = str(year)
-    
+        try:
+            month_i, year_i = int(month), int(year)
+        except ValueError:
+            now = datetime.now()
+            month_i, year_i = now.month, now.year
+    if not (1 <= month_i <= 12 and 1 <= year_i <= 9999):
+        now = datetime.now()
+        month_i, year_i = now.month, now.year
+    month = str(month_i).zfill(2)
+    year = str(year_i)
+
+    # Days in this month (correct for leap years and short months)
+    days_in_month = monthrange(year_i, month_i)[1]
+
+    # Clamp the requested day into the month so dates and navigation agree
+    day_num = max(1, min(day_num, days_in_month))
+
     # Calculate the date
-    try:
-        day_date = datetime(int(year), int(month), int(day_num))
-        day_date = day_date.date()
-        day_date_str = str(day_date)
-    except:
-        day_date = datetime.now().date()
-        day_date_str = str(day_date)
+    day_date = date(year_i, month_i, day_num)
+    day_date_str = str(day_date)
     
     # Handle recipe submission (form POST from the day page)
     if request.method == 'POST':
@@ -431,28 +440,28 @@ def day_view(day_num):
     ]
     
     # Get navigation links
-    from calendar import month_name
-    month_name_display = month_name[int(month)]
-    
-    prev_month = int(month) - 1
-    next_month = int(month) + 1
-    prev_year = int(year)
-    next_year = int(year)
-    
-    if prev_month < 1:
-        prev_month = 12
-        prev_year -= 1
+    month_name_display = month_name[month_i]
+
+    if month_i == 1:
+        prev_month_i, prev_year_i = 12, year_i - 1
     else:
-        prev_month = str(prev_month).zfill(2)
-    
-    if next_month > 12:
-        next_month = 1
-        next_year += 1
+        prev_month_i, prev_year_i = month_i - 1, year_i
+    if month_i == 12:
+        next_month_i, next_year_i = 1, year_i + 1
     else:
-        next_month = str(next_month).zfill(2)
-    
-    prev_day_url = f'/day/{day_num-1}?month={prev_month}&year={prev_year}' if day_num > 1 else f'/day/1?month={prev_month}&year={prev_year}'
-    next_day_url = f'/day/{day_num+1}?month={next_month}&year={next_year}' if day_num < days_in_month else f'/day/1?month={next_month}&year={next_year}'
+        next_month_i, next_year_i = month_i + 1, year_i
+    prev_month_days = monthrange(prev_year_i, prev_month_i)[1]
+
+    # Prev/next day stay in the same month; only wrap across month boundaries
+    if day_num > 1:
+        prev_day_url = f'/day/{day_num - 1}?month={month}&year={year}'
+    else:
+        prev_day_url = (f'/day/{prev_month_days}?month={str(prev_month_i).zfill(2)}'
+                        f'&year={prev_year_i}')
+    if day_num < days_in_month:
+        next_day_url = f'/day/{day_num + 1}?month={month}&year={year}'
+    else:
+        next_day_url = f'/day/1?month={str(next_month_i).zfill(2)}&year={next_year_i}'
     
     # Build back to calendar URL
     calendar_url = f'/calendar?month={month}&year={year}'
@@ -571,4 +580,8 @@ def search():
 
 # Start the development server
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    # Local development only: loopback bind (never LAN/public), debug OFF by
+    # default. Enable the dev server debugger explicitly with FLASK_DEBUG=1.
+    app.run(host=os.environ.get('FLASK_RUN_HOST', '127.0.0.1'),
+            port=int(os.environ.get('PORT', 5000)),
+            debug=app.debug)
