@@ -227,6 +227,66 @@
             border-radius: 3px;
         }
         
+        .flash-messages {
+            margin-bottom: 20px;
+        }
+        .flash {
+            padding: 12px 16px;
+            border-radius: 8px;
+            margin-bottom: 10px;
+            font-size: 0.95rem;
+        }
+        .flash-success {
+            background: #e6f7e9;
+            color: #1e7d32;
+            border: 1px solid #b7e4c0;
+        }
+        .flash-error {
+            background: #fdecea;
+            color: #b71c1c;
+            border: 1px solid #f5c6cb;
+        }
+        .add-recipe {
+            margin-top: 25px;
+            padding: 20px;
+            background: #f8f9fa;
+            border-radius: 12px;
+            border: 2px dashed #667eea;
+        }
+        .add-recipe h3 {
+            color: #333;
+            margin-bottom: 15px;
+            font-size: 1.1rem;
+        }
+        .add-recipe-form {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        .add-recipe-form input,
+        .add-recipe-form textarea {
+            padding: 10px 12px;
+            border: 1px solid #ccc;
+            border-radius: 8px;
+            font-size: 0.95rem;
+            font-family: inherit;
+        }
+        .add-recipe-form button {
+            align-self: flex-start;
+            background: #667eea;
+            color: white;
+            border: none;
+            padding: 10px 24px;
+            border-radius: 8px;
+            font-size: 0.95rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        .add-recipe-form button:hover {
+            background: #764ba2;
+        }
+
         @media (max-width: 768px) {
             .header {
                 flex-direction: column;
@@ -262,6 +322,15 @@
         </div>
         
         <div class="content">
+            {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+            <div class="flash-messages">
+                {% for category, message in messages %}
+                <div class="flash flash-{{ category }}">{{ message }}</div>
+                {% endfor %}
+            </div>
+            {% endif %}
+            {% endwith %}
             {% if recipes %}
             {% for recipe in recipes %}
             <div class="recipe">
@@ -283,6 +352,16 @@
             </div>
             {% endif %}
             
+            <div class="add-recipe">
+                <h3>Add a recipe for {{ day_date_display }}</h3>
+                <form method="POST" action="/day/{{ day_num }}?month={{ month }}&year={{ year }}" class="add-recipe-form">
+                    <input type="text" name="title" placeholder="Recipe title *" required maxlength="100">
+                    <input type="url" name="image" placeholder="Image URL (optional)">
+                    <textarea name="description" placeholder="Description (optional)" rows="3"></textarea>
+                    <button type="submit">Add Recipe</button>
+                </form>
+            </div>
+
             <div class="legend">
                 <div class="legend-item">
                     <div class="legend-box" style="background: #667eea;"></div>

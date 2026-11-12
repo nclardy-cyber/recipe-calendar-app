@@ -4,13 +4,17 @@ Simple calendar view with month navigation
 """
 
 from flask import Flask, render_template, request, redirect, url_for, session, flash
-# from flask_sqlalchemy import SQLAlchemy  # Disabled for now
+from flask_sqlalchemy import SQLAlchemy
 from datetime import datetime, timedelta
 import os
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24)  # Secure random secret key for sessions
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///calendar.db'
+# Use Render's Postgres when DATABASE_URL is set; fall back to local SQLite
+_db_url = os.environ.get('DATABASE_URL', 'sqlite:///calendar.db')
+if _db_url.startswith('postgres://'):
+    _db_url = _db_url.replace('postgres://', 'postgresql+psycopg://', 1)
+app.config['SQLALCHEMY_DATABASE_URI'] = _db_url
 app.config['SQLALCHEMY_TRACK_CHANGES'] = False
 @app.route('/login', methods=['GET', 'POST'])
 def login():
@@ -67,15 +71,15 @@ def logout():
 
 app.config['SQLALCHEMY_TRACK_CHANGES'] = False
 
-# db = SQLAlchemy(app)  # Disabled for now
+db = SQLAlchemy(app)
 
-# Calendar Model  # Disabled for now
-# class Recipe(db.Model):
-#     id = db.Column(db.Integer, primary_key=True)
-#     title = db.Column(db.String(100), nullable=False)
-#     image = db.Column(db.String(200))
-#     date = db.Column(db.Date)
-#     description = db.Column(db.Text)
+# Calendar Model
+class Recipe(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    title = db.Column(db.String(100), nullable=False)
+    image = db.Column(db.String(200))
+    date = db.Column(db.Date)
+    description = db.Column(db.Text)
 
 # User Model for Authentication  # Disabled for now
 # class User(db.Model):
@@ -83,10 +87,13 @@ app.config['SQLALCHEMY_TRACK_CHANGES'] = False
 #     email = db.Column(db.String(120), unique=True, nullable=False)
 #     password = db.Column(db.String(120), unique=True, nullable=False)
 
-# Initialize database  # Disabled for now
-# with app.app_context():
-#     db.create_all()
-#     print("Database initialized!")
+# Initialize database (idempotent, safe on every boot)
+try:
+    with app.app_context():
+        db.create_all()
+        print("Database initialized!")
+except Exception as _db_exc:  # don't block boot if DB is briefly unavailable
+    print(f"WARNING: could not initialize database: {_db_exc}")
 
 # Sample recipes (can be removed or customized)  # Disabled for now
 # sample_recipes = [
@@ -297,12 +304,41 @@ def get_recipes():
     """Get recipes for a specific date"""
     date = request.args.get('date')
     if date:
-        recipes = Recipe.query.filter_by(date=date).all()
+        try:
+            date_obj = datetime.strptime(date, '%Y-%m-%d').date()
+        except ValueError:
+            return {'date': date, 'recipes': []}
+        recipes = Recipe.query.filter_by(date=date_obj).all()
         return {
             'date': date,
             'recipes': [{'id': r.id, 'title': r.title, 'image': r.image, 'description': r.description} for r in recipes]
         }
     return {'recipes': []}
+
+@app.route('/api/recipes', methods=['POST'])
+def create_recipe():
+    """Create a recipe from JSON or form data."""
+    if request.is_json:
+        data = request.get_json(silent=True) or {}
+    else:
+        data = request.form.to_dict()
+    title = (data.get('title') or '').strip()
+    date_str = (data.get('date') or '').strip()
+    if not title or not date_str:
+        return {'error': 'title and date (YYYY-MM-DD) are required'}, 400
+    try:
+        recipe_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+    except ValueError:
+        return {'error': 'date must be formatted YYYY-MM-DD'}, 400
+    recipe = Recipe(
+        title=title[:100],
+        image=(data.get('image') or '').strip() or None,
+        date=recipe_date,
+        description=(data.get('description') or '').strip(),
+    )
+    db.session.add(recipe)
+    db.session.commit()
+    return {'id': recipe.id, 'title': recipe.title, 'date': str(recipe_date)}, 201
 
 @app.route('/api/recipes/<int:id>', methods=['GET', 'PUT', 'DELETE'])
 def recipe_api(id):
@@ -335,7 +371,7 @@ def recipe_api(id):
     return recipe
 
 # Day View - show all recipes for a specific day
-@app.route('/day/<int:day_num>')
+@app.route('/day/<int:day_num>', methods=['GET', 'POST'])
 def day_view(day_num):
     """Show detailed view for a specific day"""
     month = request.args.get('month')
@@ -363,10 +399,32 @@ def day_view(day_num):
         day_date = day_date.date()
         day_date_str = str(day_date)
     except:
-        day_date_str = str(datetime.now().date())
+        day_date = datetime.now().date()
+        day_date_str = str(day_date)
     
-    # Get recipes for this day
-    recipes = Recipe.query.filter_by(date=day_date_str).all()
+    # Handle recipe submission (form POST from the day page)
+    if request.method == 'POST':
+        title = (request.form.get('title') or '').strip()
+        if not title:
+            flash('Title is required', 'error')
+        else:
+            recipe = Recipe(
+                title=title[:100],
+                image=(request.form.get('image') or '').strip() or None,
+                date=day_date,
+                description=(request.form.get('description') or '').strip(),
+            )
+            db.session.add(recipe)
+            db.session.commit()
+            flash(f'Added "{title}"', 'success')
+        return redirect(f'/day/{day_num}?month={month}&year={year}')
+
+    # Get recipes for this day (serialize for the template)
+    _rows = Recipe.query.filter_by(date=day_date).all()
+    recipes = [
+        {'id': r.id, 'title': r.title, 'image': r.image, 'description': r.description}
+        for r in _rows
+    ]
     
     # Get navigation links
     from calendar import month_name
@@ -397,6 +455,8 @@ def day_view(day_num):
     
     return render_template('day_view.html',
                          day_num=day_num,
+                         month=month,
+                         year=year,
                          day_date=day_date_str,
                          day_date_display=day_date.strftime('%A, %B %d, %Y'),
                          recipes=recipes,
