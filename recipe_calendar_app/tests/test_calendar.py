@@ -193,7 +193,10 @@ def test_search_form_renders_without_query(client):
     assert resp.status_code == 200
 
 
-def test_api_recipe_roundtrip(client):
+def test_api_recipe_roundtrip(app_module, client):
+    from helpers import make_user, login
+    make_user(app_module, 'roundtrip@example.com')
+    login(client, 'roundtrip@example.com')
     # Create
     resp = client.post('/api/recipes', json={'title': 'Test Soup', 'date': '2026-04-05'})
     assert resp.status_code == 201
@@ -218,7 +221,10 @@ def test_api_recipe_roundtrip(client):
     assert client.get(f'/api/recipes/{recipe_id}').status_code == 404
 
 
-def test_api_recipe_validation(client):
+def test_api_recipe_validation(app_module, client):
+    from helpers import make_user, login
+    make_user(app_module, 'validation@example.com')
+    login(client, 'validation@example.com')
     assert client.post('/api/recipes', json={'date': '2026-04-05'}).status_code == 400
     assert client.post('/api/recipes', json={'title': 'X', 'date': 'nope'}).status_code == 400
     assert client.get('/api/recipes?date=garbage').get_json() == {'date': 'garbage', 'recipes': []}

@@ -274,6 +274,8 @@
         {% endwith %}
         
         <form method="POST" action="/login" class="login-form">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <input type="hidden" name="next" value="{{ request.args.get('next', '') }}">
             <div class="form-group">
                 <label for="email">Email</label>
                 <input type="email" id="email" name="email" value="{{ email or '' }}" placeholder="Enter your email" autofocus required>
@@ -298,6 +300,7 @@
         
         <div class="resend-verification">
             <form method="POST" action="/resend-verification">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                 <label for="resend-email" class="resend-label">Didn't get a verification email?</label>
                 <div class="resend-row">
                     <input type="email" id="resend-email" name="email" placeholder="Enter your email" required>

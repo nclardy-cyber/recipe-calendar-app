@@ -23,8 +23,9 @@ def test_signup_rate_limited_after_three_attempts(app_module, client):
     assert resp.status_code == 429
     assert 'Too many attempts' in resp.get_data(as_text=True)
     # The 4th user was NOT created (throttled before the handler ran).
-    assert app_module.User.query.filter_by(email='user3@example.com').first() \
-        is None
+    with app_module.app.app_context():
+        assert app_module.User.query.filter_by(
+            email='user3@example.com').first() is None
 
 
 def test_login_rate_limited_after_five_attempts(app_module, client):

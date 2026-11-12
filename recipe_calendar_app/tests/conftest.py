@@ -63,13 +63,46 @@ def prod_app(tmp_path, monkeypatch):
 
 @pytest.fixture()
 def client(app_module):
+    """Test client with CSRF handling done for it.
+
+    Every mutating request (POST/PUT/PATCH/DELETE) sent through this client
+    automatically carries a valid token: form data gets a ``csrf_token``
+    field, JSON bodies get an ``X-CSRFToken`` header. This is a test-harness
+    convenience only - the app enforces CSRF for every request, and the
+    ``raw_client`` fixture below is used to test missing/invalid tokens.
+    """
+    from helpers import csrf_wrapped
+
     app_module.app.config['TESTING'] = True
-    with app_module.app.test_client() as c:
-        yield c
+    # NOTE: no ``with`` around the client. Entering the context manager sets
+    # Flask 3's ``preserve_context`` flag, which keeps ONE app context (and
+    # its ``g``) alive across every subsequent request from ANY client in
+    # this thread. Flask-Login only re-resolves ``current_user`` when
+    # ``g._login_user`` is unset, so a preserved context makes the first
+    # logged-in user stick for every later request - a false ownership leak
+    # in tests. Cookies still persist via the client's own cookie jar.
+    c = app_module.app.test_client()
+    yield csrf_wrapped(c)
+
+
+@pytest.fixture()
+def raw_client(app_module):
+    """Unmodified test client - mutating requests carry NO CSRF token.
+
+    Use this for the security tests that verify missing/invalid tokens are
+    rejected with 400.
+    """
+    app_module.app.config['TESTING'] = True
+    # Same no-``with`` rationale as the ``client`` fixture above.
+    c = app_module.app.test_client()
+    yield c
 
 
 @pytest.fixture()
 def prod_client(prod_app):
+    from helpers import csrf_wrapped
+
     prod_app.app.config['TESTING'] = True
-    with prod_app.app.test_client() as c:
-        yield c
+    # Same no-``with`` rationale as the ``client`` fixture above.
+    c = prod_app.app.test_client()
+    yield csrf_wrapped(c)

@@ -4,12 +4,15 @@ Simple calendar view with month navigation
 """
 
 from flask import (Flask, Response, render_template, request, redirect,
-                   url_for, session, flash)
+                   url_for, session, flash, abort)
 from flask_sqlalchemy import SQLAlchemy
-from flask_login import LoginManager, UserMixin, current_user, login_user, logout_user
+from flask_login import (LoginManager, UserMixin, current_user, login_user,
+                         logout_user, login_required)
 from flask_migrate import Migrate
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
+from flask_wtf.csrf import CSRFProtect
+import click
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime, timedelta, date, timezone
 from calendar import monthrange, month_name
@@ -58,6 +61,11 @@ app.secret_key = _resolve_secret_key()
 # Werkzeug dev server, so the debugger cannot start under it.
 app.debug = os.environ.get('FLASK_DEBUG', '').strip().lower() in {'1', 'true', 'yes'}
 app.config['DEBUG'] = app.debug
+# CSRF protection for every state-changing request (browser forms AND
+# cookie-authenticated API writes). Tokens are session-bound; forms embed
+# {{ csrf_token() }} and JSON API clients send the X-CSRFToken header.
+csrf = CSRFProtect(app)
+app.config['WTF_CSRF_TIME_LIMIT'] = 3600  # tokens valid for 1 hour
 
 # Use Render's Postgres when DATABASE_URL is set; fall back to local SQLite
 _db_url = os.environ.get('DATABASE_URL', 'sqlite:///calendar.db')
@@ -79,6 +87,10 @@ app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 app.config['SESSION_COOKIE_SECURE'] = _is_production()
 app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(hours=12)
 app.config['SESSION_PROTECTION'] = 'basic'
+# HTTPS-aware production: absolute URLs (login "next" handling, token links
+# rendered client-side) resolve to https when production, http otherwise.
+# APP_BASE_URL (env) still governs emailed token links.
+app.config['PREFERRED_URL_SCHEME'] = 'https' if _is_production() else 'http'
 
 # --- Mail / account token configuration (all environment-driven) -----------
 # SMTP delivery is fully configurable via environment variables; no
@@ -198,6 +210,51 @@ login_manager.login_view = 'login'
 @login_manager.user_loader
 def load_user(user_id):
     return db.session.get(User, int(user_id))
+
+
+# --- Recipe ownership helpers ------------------------------------------------
+# Every recipe query that returns data to a client goes through these
+# helpers, so scoping is decided in exactly one place:
+#
+#   * authenticated user  -> only rows with user_id == current user
+#   * guest               -> a query that can never match
+#   * legacy rows (user_id IS NULL) -> invisible to every account and to
+#     guests; nothing in the app ever assigns them to a user
+#
+# Lookups by id combine the id filter with the ownership filter in a single
+# query, so a request for a recipe that exists but belongs to someone else
+# is indistinguishable from a non-existent id (404, no existence leak).
+
+def owned_recipe_query():
+    """``Recipe`` query scoped to the current user's recipes (empty for guests)."""
+    if current_user.is_authenticated:
+        return Recipe.query.filter(Recipe.user_id == current_user.id)
+    return Recipe.query.filter(db.false())
+
+
+def get_owned_recipe_or_404(recipe_id) -> Recipe:
+    """Fetch ``recipe_id`` only if it belongs to the current user.
+
+    Aborts with 404 for guests, unknown ids, legacy (unowned) rows and rows
+    owned by another user - all four cases produce the identical response.
+    """
+    if not current_user.is_authenticated:
+        abort(404)
+    recipe = db.session.execute(
+        db.select(Recipe).where(
+            Recipe.id == recipe_id,
+            Recipe.user_id == current_user.id,
+        )).scalar_one_or_none()
+    if recipe is None:
+        abort(404)
+    return recipe
+
+
+def _safe_next_url(value):
+    """Only same-site relative paths are acceptable redirect targets."""
+    if not value or not value.startswith('/') or value.startswith('//'):
+        return None
+    return value
 
 
 # --- Token / email helpers --------------------------------------------------
@@ -427,6 +484,13 @@ def login():
                 flash(INVALID_CREDENTIALS_MSG, 'error')
                 return redirect(url_for('login'))
             login_user(user, remember=bool(request.form.get('remember')))
+            # Return the user to the page they came from (e.g. a day view
+            # they tried to write before signing in). Only same-site
+            # relative paths are accepted.
+            next_url = _safe_next_url(request.form.get('next')
+                                      or request.args.get('next'))
+            if next_url:
+                return redirect(next_url)
             return redirect(url_for('calendar'))
 
         flash(INVALID_CREDENTIALS_MSG, 'error')
@@ -609,19 +673,11 @@ except Exception as _db_exc:  # don't block boot if DB is briefly unavailable
 #     db.session.commit()
 #     print("Created test users for demo!")
 
-# Calendar View - main landing page
-@app.route('/clean-samples')
-def clean_samples():
-    """Remove all sample recipes and show calendar without them."""
-    from app import app, db, Recipe
-    
-    with app.app_context():
-        samples = Recipe.query.filter(Recipe.title.contains('Sample')).all()
-        for sample in samples:
-            db.session.delete(sample)
-        db.session.commit()
-        print(f"Removed {len(samples)} sample recipes!")
-        return f"Removed {len(samples)} sample recipes. <a href='/'>Go back to calendar</a>"
+# NOTE: the former unauthenticated GET /clean-samples web endpoint (which
+# deleted any recipe whose title contained 'Sample') was removed in
+# CMP-003C. The equivalent local maintenance task is the CLI command
+# ``flask clean-samples`` defined at the bottom of this file - it refuses to
+# run in production and requires explicit confirmation.
 
 # Calendar View - main landing page
 @app.route('/')
@@ -701,7 +757,9 @@ def calendar_view():
         else:
             # Current month - always a valid current-month date
             day_date = date(year_i, month_i, day_num)
-            recipes = Recipe.query.filter_by(date=day_date).all()
+            # Scoped to the signed-in user; guests see an empty calendar and
+            # legacy (unowned) rows are invisible to everyone.
+            recipes = owned_recipe_query().filter_by(date=day_date).all()
             # Serialize recipes for template
             calendar_days.append({
                 'day': day_num,
@@ -740,16 +798,23 @@ def calendar_view():
                     else 'Guest'))
 
 # Recipe API endpoints
+# Authentication and ownership are enforced on EVERY endpoint:
+#   * guests get 401 (JSON) - no listing, no reads, no writes
+#   * authenticated users see only rows where user_id == their own id
+#   * id lookups for another user's recipe, a legacy (unowned) recipe or a
+#     non-existent id all produce the identical 404
 @app.route('/api/recipes', methods=['GET'])
 def get_recipes():
-    """Get recipes for a specific date"""
+    """Get the current user's recipes for a specific date (401 for guests)."""
+    if not current_user.is_authenticated:
+        return {'error': 'authentication required'}, 401
     date = request.args.get('date')
     if date:
         try:
             date_obj = datetime.strptime(date, '%Y-%m-%d').date()
         except ValueError:
             return {'date': date, 'recipes': []}
-        recipes = Recipe.query.filter_by(date=date_obj).all()
+        recipes = owned_recipe_query().filter_by(date=date_obj).all()
         return {
             'date': date,
             'recipes': [{'id': r.id, 'title': r.title, 'image': r.image, 'description': r.description} for r in recipes]
@@ -758,7 +823,10 @@ def get_recipes():
 
 @app.route('/api/recipes', methods=['POST'])
 def create_recipe():
-    """Create a recipe from JSON or form data."""
+    """Create a recipe from JSON or form data; the new row belongs to the
+    signed-in user (401 for guests)."""
+    if not current_user.is_authenticated:
+        return {'error': 'authentication required'}, 401
     if request.is_json:
         data = request.get_json(silent=True) or {}
     else:
@@ -776,16 +844,24 @@ def create_recipe():
         image=(data.get('image') or '').strip() or None,
         date=recipe_date,
         description=(data.get('description') or '').strip(),
+        user_id=current_user.id,
     )
     db.session.add(recipe)
     db.session.commit()
-    return {'id': recipe.id, 'title': recipe.title, 'date': str(recipe_date)}, 201
+    return {'id': recipe.id, 'title': recipe.title, 'date': str(recipe_date),
+            'owner': current_user.email}, 201
 
 @app.route('/api/recipes/<int:id>', methods=['GET', 'PUT', 'DELETE'])
 def recipe_api(id):
-    """CRUD API for recipes"""
-    recipe = Recipe.query.get_or_404(id)
-    
+    """CRUD API for the current user's recipes.
+
+    Ownership is verified before any read or write; someone else's recipe id
+    is indistinguishable from a missing id (404). Guests get 401.
+    """
+    if not current_user.is_authenticated:
+        return {'error': 'authentication required'}, 401
+    recipe = get_owned_recipe_or_404(id)
+
     if request.method == 'GET':
         return {
             'id': recipe.id,
@@ -794,22 +870,26 @@ def recipe_api(id):
             'description': recipe.description,
             'date': str(recipe.date)
         }
-    
+
     elif request.method == 'PUT':
-        data = request.get_json()
+        data = request.get_json(silent=True) or {}
         recipe.title = data.get('title', recipe.title)
         recipe.image = data.get('image', recipe.image)
         recipe.description = data.get('description', recipe.description)
-        recipe.date = datetime.strptime(data.get('date'), '%Y-%m-%d').date() if data.get('date') else recipe.date
+        if data.get('date'):
+            try:
+                recipe.date = datetime.strptime(data['date'], '%Y-%m-%d').date()
+            except ValueError:
+                return {'error': 'date must be formatted YYYY-MM-DD'}, 400
         db.session.commit()
         return {'id': recipe.id, 'title': recipe.title, 'image': recipe.image, 'description': recipe.description, 'date': str(recipe.date)}
-    
+
     elif request.method == 'DELETE':
         db.session.delete(recipe)
         db.session.commit()
         return {'id': recipe.id, 'title': recipe.title, 'deleted': True}
-    
-    return recipe
+
+    return {'error': 'method not allowed'}, 405
 
 # Day View - show all recipes for a specific day
 @app.route('/day/<int:day_num>', methods=['GET', 'POST'])
@@ -845,8 +925,13 @@ def day_view(day_num):
     day_date = date(year_i, month_i, day_num)
     day_date_str = str(day_date)
     
-    # Handle recipe submission (form POST from the day page)
+    # Handle recipe submission (form POST from the day page).
+    # Creating a recipe requires an authenticated user; guests are sent to
+    # the login page and come back to this day afterwards (next=).
     if request.method == 'POST':
+        if not current_user.is_authenticated:
+            flash('Please sign in to add recipes.', 'info')
+            return redirect(url_for('login', next=request.full_path))
         title = (request.form.get('title') or '').strip()
         if not title:
             flash('Title is required', 'error')
@@ -856,14 +941,16 @@ def day_view(day_num):
                 image=(request.form.get('image') or '').strip() or None,
                 date=day_date,
                 description=(request.form.get('description') or '').strip(),
+                user_id=current_user.id,
             )
             db.session.add(recipe)
             db.session.commit()
             flash(f'Added "{title}"', 'success')
         return redirect(f'/day/{day_num}?month={month}&year={year}')
 
-    # Get recipes for this day (serialize for the template)
-    _rows = Recipe.query.filter_by(date=day_date).all()
+    # Get recipes for this day, scoped to the signed-in user (guests and
+    # other users' recipes are not listed; legacy rows are invisible).
+    _rows = owned_recipe_query().filter_by(date=day_date).all()
     recipes = [
         {'id': r.id, 'title': r.title, 'image': r.image, 'description': r.description}
         for r in _rows
@@ -1006,6 +1093,72 @@ def search():
 
     return render_template('search.html', query=query, source=source, results=results)
 
+
+
+# --- Safe error handling -----------------------------------------------------
+# Error responses never include stack traces, SQL, config or secrets. The
+# server-side log carries the details (exception traceback for 5xx) so the
+# user-facing page can stay generic. JSON for API paths, HTML elsewhere.
+
+def _is_api_request() -> bool:
+    return (request.path.startswith('/api/')
+            or request.accept_mimetypes.best_match(['application/json', 'text/html'])
+            == 'application/json')
+
+
+@app.errorhandler(404)
+def _not_found(error):
+    if _is_api_request():
+        return {'error': 'not found'}, 404
+    return render_template('error_404.html'), 404
+
+
+@app.errorhandler(405)
+def _method_not_allowed(error):
+    if _is_api_request():
+        return {'error': 'method not allowed'}, 405
+    return render_template('error_405.html'), 405
+
+
+@app.errorhandler(500)
+def _internal_error(error):
+    logger.exception('unhandled error on %s %s', request.method, request.path)
+    if _is_api_request():
+        return {'error': 'internal server error'}, 500
+    return render_template('error_500.html'), 500
+
+
+# --- Local maintenance CLI ----------------------------------------------------
+# The web endpoint /clean-samples was removed (unauthenticated data deletion
+# over HTTP). This CLI command is the safe replacement: it runs only where an
+# operator can execute ``flask`` (the deployment host or a developer machine),
+# refuses to run in production, and requires explicit confirmation.
+@app.cli.command('clean-samples')
+@click.option('--yes', is_flag=True,
+              help='Skip the interactive confirmation prompt.')
+def clean_samples_command(yes):
+    """Delete recipes whose title contains 'Sample' (local maintenance only).
+
+    Refuses to run when FLASK_ENV is production.
+    """
+    if _is_production():
+        click.echo('Refusing to run in production. '
+                   'Use the normal delete flow per user instead.', err=True)
+        raise SystemExit(2)
+    samples = Recipe.query.filter(Recipe.title.contains('Sample')).all()
+    if not samples:
+        click.echo('No sample recipes found; nothing to do.')
+        return
+    if not yes:
+        answer = click.prompt(f'Delete {len(samples)} sample recipe(s)?',
+                              default='n')
+        if answer.strip().lower() not in {'y', 'yes'}:
+            click.echo('Aborted - nothing deleted.')
+            return
+    for sample in samples:
+        db.session.delete(sample)
+    db.session.commit()
+    click.echo(f'Deleted {len(samples)} sample recipe(s).')
 
 
 # Start the development server

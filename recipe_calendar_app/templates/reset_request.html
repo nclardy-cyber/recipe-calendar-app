@@ -164,6 +164,7 @@
         {% endwith %}
 
         <form method="POST" action="/reset-password">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <div class="form-group">
                 <label for="email">Email</label>
                 <input type="email" id="email" name="email" placeholder="Enter your email" autofocus required>

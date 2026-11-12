@@ -164,6 +164,7 @@
         {% endwith %}
 
         <form method="POST" action="/reset-password/{{ token }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <div class="form-group">
                 <label for="password">New Password <span class="password-hint">(at least 8 characters)</span></label>
                 <input type="password" id="password" name="password" minlength="8" maxlength="128" placeholder="Choose a new password" autofocus required>

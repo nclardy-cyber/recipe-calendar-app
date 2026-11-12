@@ -183,6 +183,7 @@
         {% endwith %}
         
         <form method="POST" action="/signup" class="signup-form">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <div class="form-group">
                 <label for="email">Email</label>
                 <input type="email" id="email" name="email" value="{{ email or '' }}" placeholder="Enter your email" autofocus required>

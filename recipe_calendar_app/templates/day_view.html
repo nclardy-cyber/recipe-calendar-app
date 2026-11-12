@@ -369,6 +369,7 @@
             <div class="add-recipe">
                 <h3>Add a recipe for {{ day_date_display }}</h3>
                 <form method="POST" action="/day/{{ day_num }}?month={{ month }}&year={{ year }}" class="add-recipe-form">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                     <input type="text" name="title" placeholder="Recipe title *" required maxlength="100">
                     <input type="url" name="image" placeholder="Image URL (optional)">
                     <textarea name="description" placeholder="Description (optional)" rows="3"></textarea>

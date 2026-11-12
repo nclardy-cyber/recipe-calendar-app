@@ -10,8 +10,6 @@ import hashlib
 
 from datetime import timedelta
 
-from flask_login import current_user  # noqa: F401
-
 
 EMAIL = 'alice@example.com'
 PASSWORD = 'correct-horse-battery-9'
@@ -26,8 +24,17 @@ def register(client, email=EMAIL, password=PASSWORD, follow=True):
 
 
 def get_user(app_module, email):
-    return app_module.User.query.filter_by(
-        email=app_module.normalize_email(email)).first()
+    """Load a user by email inside its own application context.
+
+    Returns a *detached* instance: already-loaded column attributes (and
+    ``check_password``, which only reads the loaded ``password_hash``
+    column) stay readable afterwards, but the object is no longer bound to
+    a session. For load-modify-commit flows, do all of it inside a single
+    ``app_context()`` instead (see the mutation tests).
+    """
+    with app_module.app.app_context():
+        return app_module.User.query.filter_by(
+            email=app_module.normalize_email(email)).first()
 
 
 def outbox_token(app_module, body_marker, last=True):
@@ -57,16 +64,18 @@ def login(client, email=EMAIL, password=PASSWORD, follow=True):
 
 
 def assert_authenticated(app_module, client, email=EMAIL):
-    with app_module.app.app_context():
-        assert current_user.is_authenticated
-        assert current_user.email == app_module.normalize_email(email)
+    """The client's session is signed in: the calendar nav shows the email.
+
+    Auth state is asserted over HTTP, not by reading ``current_user``: a
+    bare application context has no request/session, so ``current_user``
+    there would not reflect this client's session.
+    """
     page = client.get('/calendar').get_data(as_text=True)
     assert email in page  # nav shows the signed-in email
 
 
 def assert_anonymous(app_module, client, email=EMAIL):
-    with app_module.app.app_context():
-        assert not current_user.is_authenticated
+    """The client's session is not signed in: no email in the calendar nav."""
     page = client.get('/calendar').get_data(as_text=True)
     assert email not in page
 
@@ -97,7 +106,8 @@ def test_signup_rejects_duplicate_email(app_module, client):
     assert resp.status_code == 200
     page = resp.get_data(as_text=True)
     assert 'already exists' in page
-    assert app_module.User.query.count() == 1
+    with app_module.app.app_context():
+        assert app_module.User.query.count() == 1
 
 
 def test_signup_validates_email_and_password(app_module, client):
@@ -110,7 +120,8 @@ def test_signup_validates_email_and_password(app_module, client):
     # Too-long password
     resp = register(client, email=EMAIL, password='x' * 129)
     assert 'too long' in resp.get_data(as_text=True)
-    assert app_module.User.query.count() == 0
+    with app_module.app.app_context():
+        assert app_module.User.query.count() == 0
 
 
 def test_passwords_are_hashed_not_plaintext(app_module, client):
@@ -170,9 +181,11 @@ def test_login_unknown_email_same_message_as_wrong_password(app_module, client):
 
 def test_disabled_account_login_is_generic(app_module, client):
     register(client)
-    user = get_user(app_module, EMAIL)
-    user.status = 'disabled'
-    app_module.db.session.commit()
+    with app_module.app.app_context():
+        user = app_module.User.query.filter_by(
+            email=app_module.normalize_email(EMAIL)).first()
+        user.status = 'disabled'
+        app_module.db.session.commit()
     resp = login(client)
     assert 'Invalid email or password.' in resp.get_data(as_text=True)
     assert_anonymous(app_module, client)
@@ -196,10 +209,12 @@ def test_verification_success(app_module, client):
 def test_verification_expired_link(app_module, client):
     register(client)
     link = verify_link(app_module)
-    user = get_user(app_module, EMAIL)
-    user.verification_token_expires_at = (
-        app_module._utcnow() - timedelta(minutes=1))
-    app_module.db.session.commit()
+    with app_module.app.app_context():
+        user = app_module.User.query.filter_by(
+            email=app_module.normalize_email(EMAIL)).first()
+        user.verification_token_expires_at = (
+            app_module._utcnow() - timedelta(minutes=1))
+        app_module.db.session.commit()
 
     resp = client.get(link)
     assert resp.status_code == 200
@@ -275,10 +290,12 @@ def test_password_reset_expired_link(app_module, client):
     client.post('/reset-password', data={'email': EMAIL})
     link = reset_link(app_module)
 
-    user = get_user(app_module, EMAIL)
-    user.password_reset_token_expires_at = (
-        app_module._utcnow() - timedelta(minutes=1))
-    app_module.db.session.commit()
+    with app_module.app.app_context():
+        user = app_module.User.query.filter_by(
+            email=app_module.normalize_email(EMAIL)).first()
+        user.password_reset_token_expires_at = (
+            app_module._utcnow() - timedelta(minutes=1))
+        app_module.db.session.commit()
 
     resp = client.get(link)
     assert 'invalid or has expired' in resp.get_data(as_text=True)
@@ -371,7 +388,8 @@ def test_production_login_verified_account_works(prod_app, prod_client):
     # commit inside one app context so the change lands in the same scoped
     # session that owns the object.
     with prod_app.app.app_context():
-        user = get_user(prod_app, EMAIL)
+        user = prod_app.User.query.filter_by(
+            email=prod_app.normalize_email(EMAIL)).first()
         user.email_verified = True
         prod_app.db.session.commit()
     login(prod_client)
