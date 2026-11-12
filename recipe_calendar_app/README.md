@@ -6,17 +6,21 @@ A Flask-based recipe calendar web application.
 
 This app is configured for deployment on Render.com
 
+### Root Directory
+`recipe_calendar_app`
+
 ### Build Command
 `pip install -r requirements.txt`
 
 ### Start Command
-`gunicorn app:app --bind 0.0.0.0 --workers 3`
+`gunicorn app:app` — the `web` process in the `Procfile` runs this from the
+app root directory (`recipe_calendar_app`), where `app.py` defines the `app`
+object.
 
-> The `0.0.0.0` bind is only for Render's platform router. Running
-> `python app.py` locally binds to `127.0.0.1` (loopback) only. Gunicorn does
-> not run the Werkzeug dev server, and `app.debug` stays `False` unless
-> `FLASK_DEBUG=1` is set explicitly in development — so the Werkzeug debugger
-> can never be enabled in production.
+> Gunicorn does not run the Werkzeug dev server, and `app.debug` stays `False`
+> unless `FLASK_DEBUG=1` is set explicitly in development — so the Werkzeug
+> debugger can never be enabled in production. Running `python app.py` locally
+> binds to `127.0.0.1` (loopback) only.
 
 ### Environment Variables
 - `SECRET_KEY`: **required in production.** Flask session signing key.
