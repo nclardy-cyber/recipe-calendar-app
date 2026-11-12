@@ -29,16 +29,47 @@ def reload_app():
 
 @pytest.fixture()
 def app_module(tmp_path, monkeypatch):
-    """Fresh app instance backed by a temporary SQLite database."""
+    """Fresh app instance backed by a temporary SQLite database.
+
+    Rate limiting is disabled here so individual auth/feature tests are not
+    throttled; ``test_rate_limits.py`` re-enables it on a fresh app.
+    """
     monkeypatch.setenv('DATABASE_URL', _tmp_db_url(tmp_path))
     monkeypatch.setenv('SECRET_KEY', 'unit-test-secret-key')
     monkeypatch.delenv('FLASK_ENV', raising=False)
     monkeypatch.delenv('FLASK_DEBUG', raising=False)
-    yield reload_app()
+    mod = reload_app()
+    # Flask-Limiter v4 reads `enabled` from the limiter instance (config is
+    # only consulted at init_app time), so toggle the attribute directly.
+    mod.limiter.enabled = False
+    yield mod
+
+
+@pytest.fixture()
+def prod_app(tmp_path, monkeypatch):
+    """Fresh app instance in PRODUCTION mode (its own temp database).
+
+    Used to verify production behaviour (e.g. unverified accounts cannot
+    log in, no dev outbox capture when SMTP is unconfigured).
+    """
+    monkeypatch.setenv('DATABASE_URL', _tmp_db_url(tmp_path))
+    monkeypatch.setenv('SECRET_KEY', 'unit-test-secret-key')
+    monkeypatch.setenv('FLASK_ENV', 'production')
+    monkeypatch.delenv('FLASK_DEBUG', raising=False)
+    mod = reload_app()
+    mod.limiter.enabled = False
+    yield mod
 
 
 @pytest.fixture()
 def client(app_module):
     app_module.app.config['TESTING'] = True
     with app_module.app.test_client() as c:
+        yield c
+
+
+@pytest.fixture()
+def prod_client(prod_app):
+    prod_app.app.config['TESTING'] = True
+    with prod_app.app.test_client() as c:
         yield c

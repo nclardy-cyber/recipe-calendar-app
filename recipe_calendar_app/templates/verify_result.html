@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ title }} - Recipe Calendar</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        /* ===== Whole-page scaling =====
+           Every size in this UI is rem-based, and the root font-size
+           grows fluidly with the viewport, so the entire page scales
+           continuously with screen size. */
+        html {
+            font-size: clamp(16px, 13px + 0.55vw, 22px); /* px on purpose: root scale anchor */
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .result-container {
+            background: white;
+            padding: 2.5rem;
+            border-radius: 1.25rem;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            max-width: 26rem;
+            width: 90%;
+            text-align: center;
+        }
+
+        .logo {
+            margin-bottom: 1.562rem;
+        }
+
+        .logo h1 {
+            color: #667eea;
+            font-size: 2rem;
+        }
+
+        .result-card {
+            padding: 1.5rem;
+            border-radius: 0.75rem;
+            margin-bottom: 1.562rem;
+        }
+
+        .result-card.ok {
+            background: #d4edda;
+            border: 1px solid #c3e6cb;
+            color: #155724;
+        }
+
+        .result-card.fail {
+            background: #f8d7da;
+            border: 1px solid #f5c6cb;
+            color: #721c24;
+        }
+
+        .result-icon {
+            font-size: 2.5rem;
+            margin-bottom: 0.625rem;
+        }
+
+        .result-card h2 {
+            font-size: 1.25rem;
+            margin-bottom: 0.5rem;
+        }
+
+        .result-card p {
+            font-size: 0.95rem;
+            line-height: 1.5;
+        }
+
+        .result-btn {
+            display: inline-block;
+            width: 100%;
+            padding: 0.938rem;
+            background: #667eea;
+            color: white;
+            border: none;
+            border-radius: 0.625rem;
+            font-size: 1rem;
+            font-weight: 600;
+            text-decoration: none;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+
+        .result-btn:hover {
+            background: #764ba2;
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+        }
+
+        @media (max-width: 480px) {
+            .result-container {
+                padding: 1.562rem;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="result-container">
+        <div class="logo">
+            <h1>📅 Recipe Calendar</h1>
+        </div>
+
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                {% for category, message in messages %}
+                    <div class="result-card {{ 'ok' if category in ('success', 'info') else 'fail' }}" style="margin-bottom: 0.625rem;">
+                        <p>{{ message }}</p>
+                    </div>
+                {% endfor %}
+            {% endif %}
+        {% endwith %}
+
+        <div class="result-card {{ 'ok' if ok else 'fail' }}">
+            <div class="result-icon">{{ '✓' if ok else '✗' }}</div>
+            <h2>{{ title }}</h2>
+            <p>{{ message }}</p>
+        </div>
+
+        <a href="{{ back_url }}" class="result-btn">{{ back_label }}</a>
+    </div>
+</body>
+</html>

@@ -3,15 +3,21 @@ Flask Calendar Web App
 Simple calendar view with month navigation
 """
 
-from flask import Flask, render_template, request, redirect, url_for, session, flash
+from flask import (Flask, Response, render_template, request, redirect,
+                   url_for, session, flash)
 from flask_sqlalchemy import SQLAlchemy
-from flask_login import LoginManager, UserMixin
+from flask_login import LoginManager, UserMixin, current_user, login_user, logout_user
 from flask_migrate import Migrate
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 from werkzeug.security import generate_password_hash, check_password_hash
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 from calendar import monthrange, month_name
+import hashlib
 import logging
 import os
+import re
+import secrets
 
 logger = logging.getLogger(__name__)
 
@@ -61,60 +67,43 @@ elif _db_url.startswith('postgresql://'):
     _db_url = 'postgresql+psycopg://' + _db_url[len('postgresql://'):]
 app.config['SQLALCHEMY_DATABASE_URI'] = _db_url
 app.config['SQLALCHEMY_TRACK_CHANGES'] = False
-@app.route('/login', methods=['GET', 'POST'])
-def login():
-    """Handle user login"""
-    if request.method == 'POST':
-        # Simple validation without database for now
-        email = request.form.get('email', '').strip()
-        password = request.form.get('password', '')
-        
-        if not email or not password:
-            flash('Please provide both email and password', 'error')
-            return redirect(url_for('login'))
-        
-        # For now, just show a welcome message
-        flash(f'Welcome, {email}! Login successful!', 'success')
-        return redirect(url_for('calendar'))
-    
-    # GET: Show login form
-    next_url = request.args.get('next')
-    email = request.args.get('email', '')
-    return render_template('login.html', email=email, next=next_url)
 
+# --- Session security ------------------------------------------------------
+# Cookies are HttpOnly (invisible to JS), SameSite=Lax (CSRF mitigation for
+# top-level navigation), and Secure in production (HTTPS only). Flask-Login
+# 'basic' session protection forces re-login if the request IP or user agent
+# changes mid-session (a hijack signal) without the 'strong' mode false
+# positives on mobile networks.
+app.config['SESSION_COOKIE_HTTPONLY'] = True
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+app.config['SESSION_COOKIE_SECURE'] = _is_production()
+app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(hours=12)
+app.config['SESSION_PROTECTION'] = 'basic'
 
-# Signup Route
-@app.route('/signup', methods=['GET', 'POST'])
-def signup():
-    """Handle user signup"""
-    if request.method == 'POST':
-        # Simple validation without database for now
-        email = request.form.get('email', '').strip()
-        password = request.form.get('password', '')
-        
-        if not email or not password:
-            flash('Please provide both email and password', 'error')
-            return redirect(url_for('signup'))
-        
-        # For now, just show a success message
-        flash(f'Account created for {email}! Please log in.', 'success')
-        return redirect(url_for('login'))
-    
-    # GET: Show signup form
-    return render_template('signup.html')
+# --- Mail / account token configuration (all environment-driven) -----------
+# SMTP delivery is fully configurable via environment variables; no
+# credentials are hardcoded. When SMTP_HOST is unset: development/test mode
+# captures messages in the in-memory ``dev_outbox`` below so local flows are
+# testable; production logs a warning (no token details) and never captures.
+app.config['SMTP_HOST'] = os.environ.get('SMTP_HOST', '').strip()
+app.config['SMTP_PORT'] = int(os.environ.get('SMTP_PORT', '587') or 587)
+app.config['SMTP_USER'] = os.environ.get('SMTP_USER', '').strip()
+app.config['SMTP_PASSWORD'] = os.environ.get('SMTP_PASSWORD', '')
+app.config['SMTP_FROM'] = os.environ.get(
+    'SMTP_FROM', 'CalendarMealPlanner <no-reply@calendarmealplanner.com>')
+app.config['SMTP_USE_TLS'] = os.environ.get('SMTP_USE_TLS', 'true').strip().lower() in {'1', 'true', 'yes'}
+# Base URL used to build verification / reset links in emails.
+app.config['APP_BASE_URL'] = os.environ.get('APP_BASE_URL', 'http://127.0.0.1:5000').rstrip('/')
+# Time-to-live for the single-use account tokens, in minutes.
+app.config['VERIFICATION_TTL_MINUTES'] = int(os.environ.get('VERIFICATION_TTL_MINUTES', '60') or 60)
+app.config['PASSWORD_RESET_TTL_MINUTES'] = int(os.environ.get('PASSWORD_RESET_TTL_MINUTES', '30') or 30)
+app.config['PASSWORD_MIN_LENGTH'] = 8
+# Dev-only capture of emails "sent" while SMTP is unconfigured. NEVER
+# populated in production (see send_email()).
+dev_outbox = []
 
-
-# Logout Route
-@app.route('/logout')
-def logout():
-    """Handle user logout"""
-    session.pop('user_id', None)
-    session.pop('email', None)
-    session.pop('user_id_str', None)
-    flash('You have been logged out', 'info')
-    return redirect(url_for('login'))
-
-app.config['SQLALCHEMY_TRACK_CHANGES'] = False
+# The real registration/authentication routes are defined below, after the
+# User model and Flask-Login wiring.
 
 db = SQLAlchemy(app)
 migrate = Migrate(app, db)
@@ -150,6 +139,13 @@ class User(db.Model, UserMixin):
                                server_default=db.false())
     status = db.Column(db.String(20), nullable=False,
                        server_default='active', default='active')
+    # Time-limited, single-use account tokens. Only SHA-256 hashes of the raw
+    # tokens are stored, so a database leak does not expose usable tokens.
+    # ``expires_at`` is naive UTC (see _utcnow).
+    verification_token_hash = db.Column(db.String(64), nullable=True)
+    verification_token_expires_at = db.Column(db.DateTime, nullable=True)
+    password_reset_token_hash = db.Column(db.String(64), nullable=True)
+    password_reset_token_expires_at = db.Column(db.DateTime, nullable=True)
 
     def __init__(self, email=None, **kwargs):
         if email is not None:
@@ -161,6 +157,24 @@ class User(db.Model, UserMixin):
 
     def check_password(self, password: str) -> bool:
         return check_password_hash(self.password_hash, password)
+
+    def new_verification_token(self) -> str:
+        """Generate a fresh single-use verification token for this account."""
+        token = secrets.token_urlsafe(32)
+        self.verification_token_hash = _hash_token(token)
+        self.verification_token_expires_at = (
+            _utcnow() + timedelta(minutes=app.config['VERIFICATION_TTL_MINUTES'])
+        )
+        return token
+
+    def new_password_reset_token(self) -> str:
+        """Generate a fresh single-use password reset token for this account."""
+        token = secrets.token_urlsafe(32)
+        self.password_reset_token_hash = _hash_token(token)
+        self.password_reset_token_expires_at = (
+            _utcnow() + timedelta(minutes=app.config['PASSWORD_RESET_TTL_MINUTES'])
+        )
+        return token
 
 
 # Calendar Model
@@ -184,6 +198,364 @@ login_manager.login_view = 'login'
 @login_manager.user_loader
 def load_user(user_id):
     return db.session.get(User, int(user_id))
+
+
+# --- Token / email helpers --------------------------------------------------
+# Raw tokens are never stored and never logged. The database holds only
+# SHA-256 hashes; logs carry at most the recipient address and a note.
+
+def _utcnow() -> datetime:
+    """Current UTC time as a naive datetime (SQLite/PostgreSQL friendly)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode('utf-8')).hexdigest()
+
+
+EMAIL_PATTERN = re.compile(r'^[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}$')
+
+
+def _valid_email(email: str) -> bool:
+    """Basic format + length check for user-supplied email addresses."""
+    return bool(email) and len(email) <= 255 and bool(EMAIL_PATTERN.match(email))
+
+
+# Pre-computed dummy hash used to equalize response timing on password-reset
+# requests for email addresses with no account (anti-enumeration).
+DUMMY_PASSWORD_HASH = generate_password_hash('dummy-timing-equalizer-not-a-password')
+
+
+def send_email(recipient: str, subject: str, body: str) -> bool:
+    """Send a plain-text email via the configured SMTP server.
+
+    Falls back to the in-memory dev outbox when SMTP is unconfigured in
+    non-production mode. In production without SMTP it logs a warning
+    (recipient only - never the body or any token) and returns False.
+    """
+    host = app.config['SMTP_HOST']
+    if not host:
+        if _is_production():
+            logger.warning(
+                'SMTP not configured in production - email to %s was NOT sent',
+                recipient,
+            )
+            return False
+        dev_outbox.append({'to': recipient, 'subject': subject, 'body': body})
+        logger.info('SMTP not configured - captured email to %s in dev outbox', recipient)
+        return True
+
+    from email.message import EmailMessage
+    from smtplib import SMTP
+    msg = EmailMessage()
+    msg['From'] = app.config['SMTP_FROM']
+    msg['To'] = recipient
+    msg['Subject'] = subject
+    msg.set_content(body)
+    try:
+        with SMTP(host, app.config['SMTP_PORT'], timeout=20) as smtp:
+            if app.config['SMTP_USE_TLS']:
+                smtp.starttls()
+            if app.config['SMTP_USER']:
+                smtp.login(app.config['SMTP_USER'], app.config['SMTP_PASSWORD'])
+            smtp.send_message(msg)
+        return True
+    except Exception:
+        # The exception text contains SMTP/server details, never the body or
+        # tokens, so logging it is safe.
+        logger.exception('failed to send email to %s', recipient)
+        return False
+
+
+def _issue_verification_email(user):
+    """(Re)issue a verification token and email its link to the user.
+
+    Returns the raw token (used only to build the link / dev-mode flash),
+    or None when nothing was issued (already-verified account). The raw
+    token is never persisted and never logged.
+    """
+    if user.email_verified:
+        return None
+    token = user.new_verification_token()
+    db.session.commit()
+    link = f"{app.config['APP_BASE_URL']}{url_for('verify_email', token=token)}"
+    send_email(
+        user.email,
+        'Verify your email address - CalendarMealPlanner',
+        'Hello,\n\n'
+        'Please verify your email address by opening this link:\n\n'
+        f'{link}\n\n'
+        f'The link is single-use and expires in '
+        f"{app.config['VERIFICATION_TTL_MINUTES']} minutes.\n\n"
+        'If you did not create a CalendarMealPlanner account, you can ignore '
+        'this email.\n',
+    )
+    return token
+
+
+def _issue_reset_email(user) -> None:
+    """Issue a password reset token and email its link to the user."""
+    token = user.new_password_reset_token()
+    db.session.commit()
+    link = f"{app.config['APP_BASE_URL']}{url_for('reset_password_complete', token=token)}"
+    send_email(
+        user.email,
+        'Reset your password - CalendarMealPlanner',
+        'Hello,\n\n'
+        'We received a request to reset the password for your account. '
+        'Open this link to choose a new password:\n\n'
+        f'{link}\n\n'
+        f'The link is single-use and expires in '
+        f"{app.config['PASSWORD_RESET_TTL_MINUTES']} minutes.\n\n"
+        'If you did not request this, you can ignore this email - your '
+        'password will remain unchanged.\n',
+    )
+
+
+# --- Rate limiting -----------------------------------------------------------
+# Per-IP limits on the credential/account endpoints. The in-memory store is
+# per process; behind multiple workers each worker enforces its own copy
+# (limits therefore scale roughly with worker count - see README).
+def _rate_limit_handler(request_limit):
+    """Friendly 429 response (Flask-Limiter ``on_breach`` callback).
+
+    One plain, non-enumerating message for every throttled endpoint.
+    """
+    return Response(
+        'Too many attempts. Please try again later.',
+        status=429,
+        mimetype='text/plain; charset=utf-8',
+    )
+
+
+limiter = Limiter(key_func=get_remote_address, storage_uri='memory://',
+                  default_limits=[], headers_enabled=True,
+                  on_breach=_rate_limit_handler)
+limiter.init_app(app)
+
+
+# Identical user-facing message for every failed login, regardless of which
+# check failed (unknown email / wrong password / disabled / unverified in
+# production). This is deliberate: it must not reveal account existence.
+INVALID_CREDENTIALS_MSG = 'Invalid email or password.'
+RESET_GENERIC_MSG = ('If that email address has an account with an active '
+                     'status, a password reset link has been sent.')
+RESEND_GENERIC_MSG = ('If that email address has an account that still needs '
+                      'verification, a new verification link has been sent.')
+
+
+# --- Registration / authentication routes -----------------------------------
+
+@app.route('/signup', methods=['GET', 'POST'])
+# methods=['POST']: only submission attempts count; rendering the form
+# (GET) must never consume rate-limit budget or throttle page loads.
+@limiter.limit('3 per hour', methods=['POST'])
+def signup():
+    """Public account registration.
+
+    Creates the account in an unverified state and emails a single-use,
+    time-limited verification link. Production never activates an account
+    without a successful email verification.
+    """
+    if request.method == 'POST':
+        email = normalize_email(request.form.get('email'))
+        password = request.form.get('password', '')
+
+        if not _valid_email(email):
+            flash('Please enter a valid email address.', 'error')
+            return redirect(url_for('signup'))
+        if len(password) < app.config['PASSWORD_MIN_LENGTH']:
+            flash(f'Password must be at least {app.config["PASSWORD_MIN_LENGTH"]} characters.', 'error')
+            return redirect(url_for('signup'))
+        if len(password) > 128:
+            flash('Password is too long (maximum 128 characters).', 'error')
+            return redirect(url_for('signup'))
+
+        existing = db.session.execute(
+            db.select(User).where(User.email == email)).scalar_one_or_none()
+        if existing:
+            flash('An account with that email address already exists.', 'error')
+            return redirect(url_for('signup'))
+
+        user = User(email=email)
+        user.set_password(password)
+        db.session.add(user)
+        db.session.commit()
+        verification_token = _issue_verification_email(user)
+
+        if (not app.config['SMTP_HOST'] and not _is_production()
+                and verification_token):
+            # Development convenience: with no SMTP configured, surface the
+            # link in the response so local development can complete the
+            # flow. This branch is unreachable in production.
+            link = (f"{app.config['APP_BASE_URL']}"
+                    f"{url_for('verify_email', token=verification_token)}")
+            flash(f'Account created (development mode, no SMTP configured). '
+                  f'Your verification link: {link}', 'info')
+            flash('Your account was created.', 'success')
+        else:
+            flash('Your account was created. Check your email for a '
+                  'verification link before signing in.', 'success')
+        return redirect(url_for('login'))
+
+    return render_template('signup.html')
+
+
+@app.route('/login', methods=['GET', 'POST'])
+@limiter.limit('5 per 15 minutes', methods=['POST'])
+def login():
+    """Authenticate a user. All failures produce one generic message."""
+    if request.method == 'POST':
+        email = normalize_email(request.form.get('email'))
+        password = request.form.get('password', '')
+
+        user = None
+        if _valid_email(email):
+            user = db.session.execute(
+                db.select(User).where(User.email == email)).scalar_one_or_none()
+
+        if user is not None and user.check_password(password):
+            if user.status == 'disabled':
+                # Do not reveal that the account exists / is disabled.
+                flash(INVALID_CREDENTIALS_MSG, 'error')
+                return redirect(url_for('login'))
+            if _is_production() and not user.email_verified:
+                # Production requires verified email. Silently re-issue the
+                # verification email; the visible message is identical to a
+                # failed login.
+                _issue_verification_email(user)
+                flash(INVALID_CREDENTIALS_MSG, 'error')
+                return redirect(url_for('login'))
+            login_user(user, remember=bool(request.form.get('remember')))
+            return redirect(url_for('calendar'))
+
+        flash(INVALID_CREDENTIALS_MSG, 'error')
+        return redirect(url_for('login'))
+
+    return render_template('login.html', email='')
+
+
+@app.route('/logout', methods=['GET', 'POST'])
+def logout():
+    """End the current session."""
+    logout_user()
+    flash('You have been logged out.', 'info')
+    return redirect(url_for('login'))
+
+
+@app.route('/resend-verification', methods=['POST'])
+@limiter.limit('3 per hour', methods=['POST'])
+def resend_verification():
+    """Re-send a verification link. Generic response, no account enumeration."""
+    email = normalize_email(request.form.get('email'))
+    if _valid_email(email):
+        user = db.session.execute(
+            db.select(User).where(User.email == email)).scalar_one_or_none()
+        if user is not None and user.status != 'disabled' and not user.email_verified:
+            _issue_verification_email(user)
+        else:
+            # Equalize timing with the token-issuing path.
+            check_password_hash(DUMMY_PASSWORD_HASH, 'timing-equalizer')
+    flash(RESEND_GENERIC_MSG, 'success')
+    return redirect(url_for('login'))
+
+
+@app.route('/verify-email/<token>')
+def verify_email(token):
+    """Consume a single-use verification link."""
+    user = db.session.execute(
+        db.select(User).where(
+            User.verification_token_hash == _hash_token(token),
+            User.verification_token_expires_at > _utcnow(),
+        )).scalar_one_or_none()
+
+    if user is None:
+        # One message for invalid / expired / already-used links.
+        return render_template('verify_result.html',
+                               title='Verification link problem',
+                               ok=False,
+                               message='This verification link is invalid or has expired.',
+                               back_url=url_for('login'),
+                               back_label='Back to sign in')
+
+    user.email_verified = True
+    user.verification_token_hash = None
+    user.verification_token_expires_at = None
+    db.session.commit()
+    return render_template('verify_result.html',
+                           title='Email verified',
+                           ok=True,
+                           message='Your email address has been verified. You can now sign in.',
+                           back_url=url_for('login'),
+                           back_label='Sign in')
+
+
+@app.route('/reset-password', methods=['GET', 'POST'])
+@limiter.limit('3 per hour', methods=['POST'])
+def reset_password_request():
+    """Request a password reset email.
+
+    The response is identical whether or not the email has an account, and
+    timing is equalized for unknown addresses.
+    """
+    if request.method == 'POST':
+        email = normalize_email(request.form.get('email'))
+        user = None
+        if _valid_email(email):
+            user = db.session.execute(
+                db.select(User).where(User.email == email)).scalar_one_or_none()
+        if user is not None and user.status != 'disabled':
+            _issue_reset_email(user)
+        else:
+            # Equalize timing with the token-issuing path.
+            check_password_hash(DUMMY_PASSWORD_HASH, 'timing-equalizer')
+        flash(RESET_GENERIC_MSG, 'success')
+        return redirect(url_for('reset_password_request'))
+    return render_template('reset_request.html')
+
+
+@app.route('/reset-password/<token>', methods=['GET', 'POST'])
+def reset_password_complete(token):
+    """Consume a single-use reset link and set a new password."""
+    user = db.session.execute(
+        db.select(User).where(
+            User.password_reset_token_hash == _hash_token(token),
+            User.password_reset_token_expires_at > _utcnow(),
+        )).scalar_one_or_none()
+
+    if user is None:
+        # One message for invalid / expired / already-used links.
+        return render_template('verify_result.html',
+                               title='Reset link problem',
+                               ok=False,
+                               message='This password reset link is invalid or has expired. '
+                                       'Request a new one to continue.',
+                               back_url=url_for('reset_password_request'),
+                               back_label='Request a new reset link')
+
+    if request.method == 'POST':
+        password = request.form.get('password', '')
+        confirm = request.form.get('confirm', '')
+        if len(password) < app.config['PASSWORD_MIN_LENGTH']:
+            flash(f'Password must be at least {app.config["PASSWORD_MIN_LENGTH"]} characters.', 'error')
+            return render_template('reset_complete.html', token=token)
+        if len(password) > 128:
+            flash('Password is too long (maximum 128 characters).', 'error')
+            return render_template('reset_complete.html', token=token)
+        if password != confirm:
+            flash('Passwords do not match.', 'error')
+            return render_template('reset_complete.html', token=token)
+
+        user.set_password(password)
+        user.password_reset_token_hash = None
+        user.password_reset_token_expires_at = None
+        db.session.commit()
+        # Invalidate any existing session for this user; require fresh login.
+        logout_user()
+        flash('Your password has been updated. Please sign in with your new password.', 'success')
+        return redirect(url_for('login'))
+
+    return render_template('reset_complete.html', token=token)
 
 
 # Initialize database (idempotent, safe on every boot)
@@ -364,7 +736,8 @@ def calendar_view():
                          next_month_url=next_month_url,
                          month_name=month_name_display,
                          days_in_month=days_in_month,
-                         user_email=session.get('email', 'Guest'))
+                         user_email=(current_user.email if current_user.is_authenticated
+                    else 'Guest'))
 
 # Recipe API endpoints
 @app.route('/api/recipes', methods=['GET'])

@@ -279,7 +279,14 @@
                     Recipe Calendar Search
                 {% endif %}
             </h1>
-            <a href="/calendar" class="calendar-link">Back to Calendar</a>
+            <div style="display: flex; align-items: center; gap: 1rem;">
+                <a href="/calendar" class="calendar-link">Back to Calendar</a>
+                {% if current_user.is_authenticated %}
+                    <a href="/logout" style="text-decoration: none; color: #667eea; font-size: 0.9rem; font-weight: 600;">Logout ({{ current_user.email }})</a>
+                {% else %}
+                    <a href="/login" style="text-decoration: none; color: #667eea; font-size: 0.9rem; font-weight: 600;">Sign in</a>
+                {% endif %}
+            </div>
         </div>
         
         <div class="search-form">

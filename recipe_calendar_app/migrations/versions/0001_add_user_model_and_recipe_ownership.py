@@ -12,9 +12,10 @@ Existing recipe rows are left untouched: their ``user_id`` stays NULL,
 meaning "legacy/shared, owned by no account".
 
 Ordering-robust: the app runs ``db.create_all()`` at startup, so the
-``user`` table may already exist when this migration runs (boot-before-
-migration ordering). Table existence is checked before creating/dropping,
-so both orderings complete cleanly.
+``user`` table (and even a fully-featured ``recipe`` table) may already
+exist when this migration runs (boot-before-migration ordering). Table,
+column, and index existence are checked before every DDL step, so both
+orderings complete cleanly and a re-run is a no-op.
 
 SQLite + PostgreSQL compatible: the recipe ALTER runs in batch mode, which
 SQLite requires (table rebuild) and PostgreSQL also supports.
@@ -29,6 +30,14 @@ revision: str = '0001'
 down_revision: Union[str, None] = None
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
+
+
+def _column_names(table: str) -> set:
+    return {c['name'] for c in sa.inspect(op.get_bind()).get_columns(table)}
+
+
+def _index_names(table: str) -> set:
+    return {i['name'] for i in sa.inspect(op.get_bind()).get_indexes(table)}
 
 
 def upgrade() -> None:
@@ -58,16 +67,18 @@ def upgrade() -> None:
     # Add ownership to an EXISTING recipe table (legacy upgrade path).
     # On a fresh database the recipe table does not exist yet; it is created
     # later by the app's db.create_all() (or a subsequent migration) already
-    # containing user_id.
-    inspector = sa.inspect(op.get_bind())
-    if 'recipe' in inspector.get_table_names():
-        with op.batch_alter_table('recipe') as batch_op:
-            batch_op.add_column(sa.Column('user_id', sa.Integer(),
-                                          nullable=True))
-            batch_op.create_foreign_key(
-                'fk_recipe_user_id_user', 'user', ['user_id'], ['id'])
-        op.create_index(op.f('ix_recipe_user_id'), 'recipe', ['user_id'],
-                        unique=False)
+    # containing user_id. If the app booted first and create_all() already
+    # created user_id + its FK + index, every step below is skipped.
+    if 'recipe' in table_names:
+        if 'user_id' not in _column_names('recipe'):
+            with op.batch_alter_table('recipe') as batch_op:
+                batch_op.add_column(sa.Column('user_id', sa.Integer(),
+                                              nullable=True))
+                batch_op.create_foreign_key(
+                    'fk_recipe_user_id_user', 'user', ['user_id'], ['id'])
+        if 'ix_recipe_user_id' not in _index_names('recipe'):
+            op.create_index(op.f('ix_recipe_user_id'), 'recipe',
+                            ['user_id'], unique=False)
 
 
 def downgrade() -> None:
@@ -75,12 +86,29 @@ def downgrade() -> None:
     table_names = set(inspector.get_table_names())
 
     if 'recipe' in table_names:
-        op.drop_index(op.f('ix_recipe_user_id'), table_name='recipe')
-        with op.batch_alter_table('recipe') as batch_op:
-            batch_op.drop_constraint('fk_recipe_user_id_user',
-                                     type_='foreignkey')
-            batch_op.drop_column('user_id')
+        recipe_cols = _column_names('recipe')
+        index_names = _index_names('recipe')
+        if 'user_id' in recipe_cols:
+            if 'ix_recipe_user_id' in index_names:
+                op.drop_index(op.f('ix_recipe_user_id'),
+                              table_name='recipe')
+            # Drop every FK on recipe that references user, whether created
+            # by this migration (named) or by the app's db.create_all()
+            # (PostgreSQL auto-names it; SQLite inlines it and the batch
+            # rebuild below removes it).
+            fk_names = [fk['name'] for fk in
+                        inspector.get_foreign_keys('recipe')
+                        if fk.get('referred_table') == 'user'
+                        and fk.get('name')]
+            with op.batch_alter_table('recipe') as batch_op:
+                for fk_name in fk_names:
+                    batch_op.drop_constraint(fk_name, type_='foreignkey')
+                batch_op.drop_column('user_id')
+        elif 'ix_recipe_user_id' in index_names:
+            # Column already gone but its index survived (partial state).
+            op.drop_index(op.f('ix_recipe_user_id'), table_name='recipe')
 
     if 'user' in table_names:
-        op.drop_index(op.f('ix_user_email'), table_name='user')
+        if 'ix_user_email' in _index_names('user'):
+            op.drop_index(op.f('ix_user_email'), table_name='user')
         op.drop_table('user')

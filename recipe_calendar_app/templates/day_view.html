@@ -316,6 +316,11 @@
                 <h1>{{ month_name_display }} {{ year_display }}</h1>
                 <div class="day-badge">Day {{ day_num }}</div>
                 <a href="{{ calendar_url }}" class="calendar-link">Back to Calendar</a>
+                {% if current_user.is_authenticated %}
+                    <a href="/logout" style="text-decoration: none; color: #667eea; font-size: 0.9rem; font-weight: 600;">Logout ({{ current_user.email }})</a>
+                {% else %}
+                    <a href="/login" style="text-decoration: none; color: #667eea; font-size: 0.9rem; font-weight: 600;">Sign in</a>
+                {% endif %}
             </div>
             <div class="month-nav">
                 <button class="nav-btn" onclick="window.location.href='{{ prev_day_url }}'">

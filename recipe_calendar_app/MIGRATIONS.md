@@ -1,4 +1,4 @@
-# Database Migrations (CMP-003A)
+# Database Migrations (CMP-003A + CMP-003B)
 
 This app uses **Flask-Migrate / Alembic** for schema changes. All migration
 files live in `migrations/`; the Alembic configuration is `alembic.ini`.
@@ -18,6 +18,12 @@ Migrations are written for **both SQLite and PostgreSQL**:
   includes `user_id`), so the migration only creates the `user` table.
 - Server defaults use portable expressions (`CURRENT_TIMESTAMP`, `false`,
   text literal `'active'`) accepted by both engines.
+- The `0002` downgrade (dropping the four token columns) uses native
+  `ALTER TABLE user DROP COLUMN` instead of batch mode: a SQLite batch
+  rebuild re-emits the reflected `status` string default without quotes
+  (`DEFAULT (active)`), which SQLite rejects as "not constant". Native
+  `DROP COLUMN` requires SQLite >= 3.35 (every Python 3.11+ runtime ships
+  newer) and works as-is on PostgreSQL.
 
 The live database is selected via `SQLALCHEMY_DATABASE_URI`, which the app
 derives from the `DATABASE_URL` environment variable (Postgres in
@@ -28,6 +34,7 @@ production, local SQLite in development).
 | Revision | Description |
 |----------|-------------|
 | `0001`   | Adds the `user` table (unique normalized email, password hash, `created_at`, `email_verified`, `status`) and adds nullable `recipe.user_id` + FK to `user.id`. Existing recipe rows keep `user_id = NULL` (legacy/unowned). |
+| `0002`   | Adds four nullable token columns to `user`: `verification_token_hash`, `verification_token_expires_at`, `password_reset_token_hash`, `password_reset_token_expires_at`. Only SHA-256 hashes are stored — raw tokens never touch the database. |
 
 ## Upgrade
 
@@ -59,10 +66,11 @@ python -m flask db downgrade base    # roll everything back to an empty schema
 python -m flask db downgrade 0001    # roll back to a specific revision
 ```
 
-`0001`'s `downgrade()` removes `recipe.user_id` (with its FK) and the
-`user` table. **Warning:** rolling back after users have been created or
-recipes have been assigned to users destroys that data. Back up the
-database first (see below).
+`0002`'s `downgrade()` drops the four token columns (invalidating any
+pending verification/reset tokens). `0001`'s `downgrade()` removes
+`recipe.user_id` (with its FK) and the `user` table. **Warning:** rolling
+back after users have been created or recipes have been assigned to users
+destroys that data. Back up the database first (see below).
 
 ## Pre-migration backup procedure (required)
 
@@ -100,8 +108,11 @@ databases):
 - upgrade on a legacy schema with no rows,
 - upgrade on a legacy database with pre-existing recipe rows
   (rows preserved, `user_id` stays NULL),
+- upgrade after the app booted first (startup `db.create_all()` pre-created
+  the `user` table, or both tables at their full current shape — the
+  migrations no-op cleanly instead of failing with duplicate columns),
 - full downgrade back to `base` (schema reverts, rows preserved),
-- `alembic_version` bookkeeping.
+- `alembic_version` bookkeeping (asserted against the dynamic head).
 
 Run them with the test venv:
 

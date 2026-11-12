@@ -65,7 +65,13 @@
             margin-bottom: 0.5rem;
             font-size: 0.95rem;
         }
-        
+
+        .password-hint {
+            font-weight: 400;
+            color: #888;
+            font-size: 0.85rem;
+        }
+
         .form-group input {
             width: 100%;
             padding: 0.938rem;
@@ -125,7 +131,14 @@
             color: #721c24;
             border: 1px solid #f5c6cb;
         }
-        
+
+        .message.info {
+            background: #d1ecf1;
+            color: #0c5460;
+            border: 1px solid #bee5eb;
+            word-break: break-all;
+        }
+
         .footer {
             text-align: center;
             margin-top: 1.562rem;
@@ -176,8 +189,8 @@
             </div>
             
             <div class="form-group">
-                <label for="password">Password</label>
-                <input type="password" id="password" name="password" placeholder="Choose a password" required>
+                <label for="password">Password <span class="password-hint">(at least 8 characters)</span></label>
+                <input type="password" id="password" name="password" minlength="8" maxlength="128" placeholder="Choose a password" required>
             </div>
             
             <button type="submit" class="signup-btn">Create Account</button>

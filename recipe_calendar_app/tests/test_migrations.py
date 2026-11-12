@@ -168,6 +168,36 @@ def test_upgrade_after_app_boot_created_user_table(app_module, tmp_path):
         con.close()
 
 
+def test_upgrade_after_full_create_all_boot(app_module, tmp_path):
+    """App booted first against a truly empty DB: startup db.create_all()
+    created BOTH tables at their full current shape (user with token
+    columns, recipe with user_id + FK + index). The migrations must
+    complete as a no-op instead of failing with duplicate column/index
+    errors, and the schema must be left intact."""
+    db_path = tmp_path / 'boot_first_full.db'
+
+    from sqlalchemy import create_engine
+    engine = create_engine('sqlite:///' + str(db_path).replace('\\', '/'))
+    with engine.begin() as conn:
+        app_module.db.metadata.create_all(conn)
+    engine.dispose()
+
+    command.upgrade(_alembic_cfg(db_path), 'head')
+
+    tables = _table_names(db_path)
+    assert 'user' in tables
+    assert 'recipe' in tables
+    assert 'user_id' in _recipe_columns(db_path)
+    con = sqlite3.connect(db_path)
+    try:
+        user_cols = {r[1] for r in con.execute('PRAGMA table_info(user)')}
+        assert {'verification_token_hash', 'verification_token_expires_at',
+                'password_reset_token_hash',
+                'password_reset_token_expires_at'} <= user_cols
+    finally:
+        con.close()
+
+
 def test_downgrade_reverts_schema_and_preserves_rows(tmp_path):
     db_path = tmp_path / 'legacy.db'
     _build_legacy_db(db_path)
@@ -193,10 +223,12 @@ def test_alembic_version_bookkeeping(tmp_path):
     db_path = tmp_path / 'fresh.db'
     cfg = _alembic_cfg(db_path)
     command.upgrade(cfg, 'head')
+    from alembic.script import ScriptDirectory
+    head = ScriptDirectory.from_config(cfg).get_current_head()
     con = sqlite3.connect(db_path)
     try:
         assert con.execute(
-            'SELECT version_num FROM alembic_version').fetchone()[0] == '0001'
+            'SELECT version_num FROM alembic_version').fetchone()[0] == head
     finally:
         con.close()
     # A full downgrade to base drops the user table; alembic keeps the

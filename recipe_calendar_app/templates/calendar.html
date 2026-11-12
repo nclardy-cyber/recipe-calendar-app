@@ -353,9 +353,14 @@
         <div class="header">
             <h1 id="month-title">{{ month_name }} {{ year }}</h1>
             <div class="user-info">
-                <div class="user-avatar">{{ user_email[:2]|upper }}</div>
-                <div class="user-email">{{ user_email or 'Guest' }}</div>
-                <a href="/logout" style="text-decoration: none; color: #667eea; font-size: 0.9rem; font-weight: 600; padding: 0.5rem 0.938rem; border-radius: 0.375rem; transition: all 0.2s;">Logout</a>
+                {% if current_user.is_authenticated %}
+                    <div class="user-avatar">{{ user_email[:2]|upper }}</div>
+                    <div class="user-email">{{ user_email }}</div>
+                    <a href="/logout" style="text-decoration: none; color: #667eea; font-size: 0.9rem; font-weight: 600; padding: 0.5rem 0.938rem; border-radius: 0.375rem; transition: all 0.2s;">Logout</a>
+                {% else %}
+                    <a href="/login" style="text-decoration: none; color: #667eea; font-size: 0.9rem; font-weight: 600; padding: 0.5rem 0.938rem; border-radius: 0.375rem; transition: all 0.2s;">Sign in</a>
+                    <a href="/signup" style="text-decoration: none; color: white; background: #667eea; font-size: 0.9rem; font-weight: 600; padding: 0.5rem 0.938rem; border-radius: 0.375rem; transition: all 0.2s;">Sign up</a>
+                {% endif %}
             </div>
             <a href="/clean-samples" class="clean-samples-link" title="Remove sample recipes">🗑️ Clean Samples</a>
             <div class="nav-buttons">
