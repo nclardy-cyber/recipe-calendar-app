@@ -71,7 +71,7 @@ Set them in Render's environment settings. Never commit real credentials
 | `DATABASE_URL` | PostgreSQL connection string, e.g. `postgres://user:***@host:5432/dbname` — use Render Postgres' **internal** connection string (the external one is rejected by Render's network for same-region services) | Must be a `postgres://`, `postgresql://` or `postgresql+psycopg://` URL. Required: an unset value would silently fall back to a local SQLite file, which Render's ephemeral filesystem discards on every deploy |
 | `REDIS_URL` | Shared rate-limit storage | Must use the `redis://` or `rediss://` scheme. Rate limiting runs on shared Redis, never per-process in-memory, in production |
 | `SMTP_HOST` | Mail server for verification/reset emails | Required, non-empty |
-| `SMTP_PORT` | Mail server port | Must be an integer between 1 and 65535 (default `587`). Use `587` for STARTTLS or `465` for implicit TLS. |
+| `SMTP_PORT` | Mail server port | Must be an integer between 1 and 65535 (default `587`). Use `587` with STARTTLS — the app connects with `smtplib.SMTP` and upgrades via `starttls()` (enabled by default through `SMTP_USE_TLS`), so the SMTP provider must support STARTTLS. Port `465` (implicit TLS) is **not supported**: the code never opens an `SMTP_SSL` connection, so a 465 endpoint fails at the transport layer. |
 | `SMTP_USER` | SMTP account | Required, non-empty |
 | `SMTP_PASSWORD` | SMTP account password | Required, non-empty. Never logged |
 | `APP_BASE_URL` | Base URL used in emailed links | Must start with `https://` — emailed links must use HTTPS |
