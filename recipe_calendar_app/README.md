@@ -35,13 +35,34 @@ python -m flask db upgrade && gunicorn -c gunicorn.conf.py --bind 0.0.0.0:$PORT 
 > debugger can never be enabled in production. Running `python app.py` locally
 > binds to `127.0.0.1` (loopback) only.
 
+> **Single instance only — no migration concurrency lock.** While the start
+> command above is used, the Render web service must run **exactly one
+> instance**: every instance runs `flask db upgrade` at startup, and no
+> migration concurrency lock exists in the Alembic chain, so two instances
+> starting at the same time can race on the same migrations. Do **not**
+> enable multiple instances or autoscaling until migration execution is moved
+> to a separately controlled, single-run operation (for example, a one-off
+> Render job or a build step) that runs before any web instance starts.
+
+### Python runtime
+
+Render must use **Python ≥ 3.11**. The currently resolved transitive
+SQLAlchemy dependency (SQLAlchemy 2.1.x, pulled in via Flask-SQLAlchemy and
+Alembic) declares `Requires-Python >= 3.11`, so older runtimes cannot install
+the pinned dependency set. **Recommended: Python 3.12.**
+
+Operator instruction: in the Render service's **Runtime** settings, select the
+Python runtime and explicitly **pin the version to 3.12** — do not leave it
+on a default or older version, so a Render-side default change cannot
+silently break the install.
+
 ### Environment variables (production)
 
 The following are **required in production** (i.e. when `FLASK_ENV=production`
-is set): the app validates them at startup and **refuses to start**, listing
-every missing or invalid variable in one message. Set them in Render's
-environment settings. Never commit real credentials (`.env*` files are
-git-ignored).
+is set), except where marked optional: the app validates them at startup and
+**refuses to start**, listing every missing or invalid variable in one message.
+Set them in Render's environment settings. Never commit real credentials
+(`.env*` files are git-ignored).
 
 | Variable | Purpose | Validation |
 |---|---|---|
@@ -55,9 +76,15 @@ git-ignored).
 | `SMTP_PASSWORD` | SMTP account password | Required, non-empty. Never logged |
 | `APP_BASE_URL` | Base URL used in emailed links | Must start with `https://` — emailed links must use HTTPS |
 | `FLASK_DEBUG` | (development only) `1` enables the Werkzeug debugger when running `python app.py` locally | **Never set in production** |
+| `TRUSTED_PROXY_HOPS` | Optional. Number of trusted proxy hops between the client and the app (Render's load balancer); determines how client identity is resolved for rate limiting | Optional non-negative integer. Unset: production defaults to `1`, development to `0`. Invalid values (non-integer or negative) prevent startup |
 
 `PORT` is provided by Render itself and is not configured here — the start
 command binds it directly.
+
+The production default of `1` for `TRUSTED_PROXY_HOPS` assumes exactly one
+trusted proxy hop in front of the service. Render's actual forwarding
+behavior must be verified against a live service before relying on that
+default; if it differs, set `TRUSTED_PROXY_HOPS` explicitly.
 
 ### Migrations at deploy time
 
@@ -101,6 +128,30 @@ with 500 while Redis is unreachable, so an outage never disables limiting.
   on the backup.
 * The local SQLite databases (`db/calendar.db`, `instance/calendar.db`) are
   development-only, are not tracked in git, and never exist on Render.
+* **Rolling back the application is not rolling back the database.**
+  Reverting or redeploying an older application version does **not** require
+  a database downgrade: the start command's `flask db upgrade` only moves the
+  schema forward, and older app versions keep working against a newer schema
+  as long as they only use existing columns. Never run
+  `flask db downgrade` automatically as part of an application rollback.
+  Database downgrades are a separate, manual operation: take a backup,
+  verify it (see above), and explicitly review the specific migration's
+  downgrade risks before running it. Some downgrades can destroy user data
+  (for example by dropping tables or columns), so a verified backup and a
+  tested restore are mandatory before attempting one.
+
+## Recipe title behavior
+
+Recipe titles are limited to 100 characters (the database column is
+`String(100)`). Existing behavior, documented as-is:
+
+* Create paths (the recipe `POST` API and the calendar form) **truncate**
+  titles longer than 100 characters to 100.
+* The recipe `PUT` endpoint **rejects** titles longer than 100 characters
+  with HTTP 400 instead of truncating.
+
+This behavior is intentional and must not be changed; clients should send
+titles of at most 100 characters.
 
 ## Local development
 
