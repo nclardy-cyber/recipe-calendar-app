@@ -49,13 +49,23 @@ def app_module(tmp_path, monkeypatch):
 def prod_app(tmp_path, monkeypatch):
     """Fresh app instance in PRODUCTION mode (its own temp database).
 
-    Used to verify production behaviour (e.g. unverified accounts cannot
-    log in, no dev outbox capture when SMTP is unconfigured).
+    Supplies the full production environment (strong SECRET_KEY, REDIS_URL,
+    SMTP credentials, HTTPS APP_BASE_URL) so the production startup gate
+    passes. The limiter is disabled on this fixture, so REDIS_URL/SMTP are
+    never actually contacted by the tests that use it.
     """
     monkeypatch.setenv('DATABASE_URL', _tmp_db_url(tmp_path))
-    monkeypatch.setenv('SECRET_KEY', 'unit-test-secret-key')
+    monkeypatch.setenv('SECRET_KEY', 'unit-test-production-secret-key-0123456789')
     monkeypatch.setenv('FLASK_ENV', 'production')
     monkeypatch.delenv('FLASK_DEBUG', raising=False)
+    monkeypatch.setenv('REDIS_URL', 'redis://127.0.0.1:6390/9')
+    monkeypatch.setenv('SMTP_HOST', '127.0.0.1')
+    # Port 1: nothing listens there, so any email send fails fast with a
+    # connection refusal (non-fatal) instead of hanging.
+    monkeypatch.setenv('SMTP_PORT', '1')
+    monkeypatch.setenv('SMTP_USER', 'unit-test-smtp-user')
+    monkeypatch.setenv('SMTP_PASSWORD', 'unit-test-smtp-password')
+    monkeypatch.setenv('APP_BASE_URL', 'https://unit-test.example')
     mod = reload_app()
     mod.limiter.enabled = False
     yield mod

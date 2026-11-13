@@ -27,10 +27,14 @@ logger = logging.getLogger(__name__)
 # --- Security configuration --------------------------------------------------
 # SECRET_KEY is read from the environment. It is NEVER generated randomly on
 # startup (that invalidates all sessions on every restart) and is never logged.
-# Production: a missing SECRET_KEY aborts startup. Development: a fixed,
-# clearly-marked fallback key is used so local sessions survive restarts.
+# Production: a missing or weak SECRET_KEY aborts startup. Development: a
+# fixed, clearly-marked fallback key is used so local sessions survive
+# restarts.
 DEV_FALLBACK_SECRET_KEY = 'dev-only-insecure-secret-key-change-me'
 _PRODUCTION_ENVS = {'production', 'prod'}
+# Production keys must be at least this long (32 URL-safe chars, as produced
+# by secrets.token_urlsafe(32), is the recommended minimum).
+PRODUCTION_SECRET_KEY_MIN_LENGTH = 32
 
 
 def _is_production() -> bool:
@@ -39,19 +43,74 @@ def _is_production() -> bool:
 
 def _resolve_secret_key() -> str:
     key = os.environ.get('SECRET_KEY', '').strip()
-    if key:
-        return key
     if _is_production():
-        raise RuntimeError(
-            'SECRET_KEY environment variable is required in production. '
-            'Generate one with: '
-            'python -c "import secrets; print(secrets.token_urlsafe(32))"'
+        if not key:
+            raise RuntimeError(
+                'SECRET_KEY environment variable is required in production. '
+                'Generate one with: '
+                'python -c "import secrets; print(secrets.token_urlsafe(32))"'
+            )
+        if (len(key) < PRODUCTION_SECRET_KEY_MIN_LENGTH
+                or key == DEV_FALLBACK_SECRET_KEY):
+            raise RuntimeError(
+                'SECRET_KEY is not strong enough for production: it must be '
+                f'at least {PRODUCTION_SECRET_KEY_MIN_LENGTH} characters and '
+                'must not be the development fallback key. Generate one with: '
+                'python -c "import secrets; print(secrets.token_urlsafe(32))"'
+            )
+        return key
+    if not key:
+        logger.warning(
+            'SECRET_KEY not set - using the insecure development fallback '
+            'key. Set SECRET_KEY before deploying.'
         )
-    logger.warning(
-        'SECRET_KEY not set - using the insecure development fallback key. '
-        'Set SECRET_KEY before deploying.'
-    )
-    return DEV_FALLBACK_SECRET_KEY
+        key = DEV_FALLBACK_SECRET_KEY
+    return key
+
+
+def _validate_production_environment() -> None:
+    """Fail-safe production startup gate (CMP-005B).
+
+    Production must never boot with a silently degraded security posture.
+    Every problem found is collected and reported in ONE error so an
+    operator fixes the whole configuration, not one gap at a time:
+
+    * REDIS_URL       - required; rate limiting must run on shared Redis
+                        storage, never per-process in-memory, in production.
+    * SMTP_HOST / SMTP_USER / SMTP_PASSWORD
+                      - required; account emails must be deliverable.
+    * APP_BASE_URL    - must be https://; emailed links must use HTTPS.
+
+    (SECRET_KEY presence/strength is checked first, in _resolve_secret_key.)
+    Development is intentionally lax: none of these are required.
+    """
+    problems = []
+
+    redis_url = os.environ.get('REDIS_URL', '').strip()
+    if not redis_url:
+        problems.append(
+            'REDIS_URL is required in production (a redis:// or rediss:// '
+            'URL); rate limiting must never run on per-process in-memory '
+            'storage in production'
+        )
+    elif not redis_url.lower().startswith(('redis://', 'rediss://')):
+        problems.append('REDIS_URL must start with redis:// or rediss://')
+
+    for var in ('SMTP_HOST', 'SMTP_USER', 'SMTP_PASSWORD'):
+        if not os.environ.get(var, '').strip():
+            problems.append(f'{var} is required in production')
+
+    if not os.environ.get('APP_BASE_URL', '').strip().lower().startswith('https://'):
+        problems.append(
+            'APP_BASE_URL must be an https:// URL in production (emailed '
+            'verification and reset links must use HTTPS)'
+        )
+
+    if problems:
+        raise RuntimeError(
+            'Production configuration is incomplete - refusing to start:\n  - '
+            + '\n  - '.join(problems)
+        )
 
 
 app = Flask(__name__)
@@ -77,11 +136,19 @@ app.config['SQLALCHEMY_DATABASE_URI'] = _db_url
 app.config['SQLALCHEMY_TRACK_CHANGES'] = False
 
 # --- Session security ------------------------------------------------------
+# Session policy (CMP-005B), two tiers:
+#   * default sign-in (no "remember me"): BROWSER-CLOSE session. The session
+#     cookie carries no expiry (no Max-Age/Expires), so the browser
+#     discards it on close. session.permanent stays False.
+#   * "remember me": PERSISTENT session. The login route sets
+#     session.permanent = True, applying PERMANENT_SESSION_LIFETIME
+#     (12 hours) and giving the cookie Max-Age=43200.
 # Cookies are HttpOnly (invisible to JS), SameSite=Lax (CSRF mitigation for
-# top-level navigation), and Secure in production (HTTPS only). Flask-Login
-# 'basic' session protection forces re-login if the request IP or user agent
-# changes mid-session (a hijack signal) without the 'strong' mode false
-# positives on mobile networks.
+# top-level navigation), and Secure in production (HTTPS only); Secure is
+# off in development so local plain-HTTP testing keeps working. Flask-Login
+# 'basic' session protection forces re-login if the request IP or user
+# agent changes mid-session (a hijack signal) without the 'strong' mode
+# false positives on mobile networks.
 app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 app.config['SESSION_COOKIE_SECURE'] = _is_production()
@@ -91,14 +158,25 @@ app.config['SESSION_PROTECTION'] = 'basic'
 # rendered client-side) resolve to https when production, http otherwise.
 # APP_BASE_URL (env) still governs emailed token links.
 app.config['PREFERRED_URL_SCHEME'] = 'https' if _is_production() else 'http'
+# Fail-safe production gate: refuse to boot with missing/unsafe production
+# settings (SECRET_KEY strength was already checked in _resolve_secret_key).
+if _is_production():
+    _validate_production_environment()
 
 # --- Mail / account token configuration (all environment-driven) -----------
-# SMTP delivery is fully configurable via environment variables; no
-# credentials are hardcoded. When SMTP_HOST is unset: development/test mode
-# captures messages in the in-memory ``dev_outbox`` below so local flows are
-# testable; production logs a warning (no token details) and never captures.
+# SMTP delivery is fully configured via environment variables; no
+# credentials are hardcoded, and SMTP_USER/SMTP_PASSWORD are never logged.
+# When SMTP_HOST is unset, the dev-only outbox below captures messages in
+# memory so local flows are testable; the outbox is NEVER used when
+# SMTP_HOST is set, and in production it is never used at all (production
+# additionally REQUIRES SMTP_HOST/SMTP_USER/SMTP_PASSWORD - see
+# _validate_production_environment). A delivery failure in production logs a
+# warning (no token details) and the request continues.
 app.config['SMTP_HOST'] = os.environ.get('SMTP_HOST', '').strip()
-app.config['SMTP_PORT'] = int(os.environ.get('SMTP_PORT', '587') or 587)
+try:
+    app.config['SMTP_PORT'] = int(os.environ.get('SMTP_PORT', '587') or 587)
+except ValueError:
+    raise RuntimeError('SMTP_PORT must be an integer (e.g. 587)')
 app.config['SMTP_USER'] = os.environ.get('SMTP_USER', '').strip()
 app.config['SMTP_PASSWORD'] = os.environ.get('SMTP_PASSWORD', '')
 app.config['SMTP_FROM'] = os.environ.get(
@@ -385,9 +463,36 @@ def _rate_limit_handler(request_limit):
     )
 
 
-limiter = Limiter(key_func=get_remote_address, storage_uri='memory://',
-                  default_limits=[], headers_enabled=True,
-                  on_breach=_rate_limit_handler)
+# Storage (CMP-005B):
+#   * production: REDIS_URL from the environment (required at startup by
+#     _validate_production_environment). Every gunicorn worker shares the
+#     same Redis-backed counters, so the limits hold across workers.
+#     In-memory storage is NEVER used in production.
+#   * development/tests: an isolated per-process in-memory store, so local
+#     work and the test suite never need (or touch) a Redis server.
+#
+# Redis outage behaviour (production): the limiter runs with
+# in_memory_fallback_enabled=False and swallow_errors=False. If Redis is
+# unreachable, requests to a rate-limited endpoint FAIL CLOSED with a 500
+# error instead of silently degrading to per-worker in-memory counters
+# (which would multiply every limit by the worker count). Unlimited
+# endpoints (calendar, day view, search) are unaffected. The storage client
+# connects lazily, so an unreachable Redis at boot does not block startup -
+# the fail-closed behaviour applies from the first rate-limited request.
+# storage_options protocol=2 keeps the client on RESP2, which every Redis
+# server understands (newer redis-py versions default to a HELLO/RESP3
+# handshake that very old servers reject).
+limiter = Limiter(
+    key_func=get_remote_address,
+    storage_uri=os.environ.get('REDIS_URL', '').strip()
+    if _is_production() else 'memory://',
+    storage_options={'protocol': 2},
+    default_limits=[],
+    headers_enabled=True,
+    in_memory_fallback_enabled=False,
+    swallow_errors=False,
+    on_breach=_rate_limit_handler,
+)
 limiter.init_app(app)
 
 
@@ -483,7 +588,14 @@ def login():
                 _issue_verification_email(user)
                 flash(INVALID_CREDENTIALS_MSG, 'error')
                 return redirect(url_for('login'))
-            login_user(user, remember=bool(request.form.get('remember')))
+            remember = bool(request.form.get('remember'))
+            login_user(user, remember=remember)
+            if remember:
+                # Session policy: remember-me sessions are persistent with a
+                # 12-hour cookie lifetime (PERMANENT_SESSION_LIFETIME). Set
+                # explicitly so the policy does not rely on Flask-Login
+                # internals alone.
+                session.permanent = True
             # Return the user to the page they came from (e.g. a day view
             # they tried to write before signing in). Only same-site
             # relative paths are accepted.
@@ -501,8 +613,14 @@ def login():
 
 @app.route('/logout', methods=['GET', 'POST'])
 def logout():
-    """End the current session."""
+    """End the current session.
+
+    logout_user() drops the identity; session.clear() additionally removes
+    any remaining session state (e.g. the CSRF token) so the re-issued
+    cookie carries nothing that identifies the old session.
+    """
     logout_user()
+    session.clear()
     flash('You have been logged out.', 'info')
     return redirect(url_for('login'))
 
