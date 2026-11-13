@@ -50,7 +50,7 @@ git-ignored).
 | `DATABASE_URL` | PostgreSQL connection string, e.g. `postgres://user:***@host:5432/dbname` — use Render Postgres' **internal** connection string (the external one is rejected by Render's network for same-region services) | Must be a `postgres://`, `postgresql://` or `postgresql+psycopg://` URL. Required: an unset value would silently fall back to a local SQLite file, which Render's ephemeral filesystem discards on every deploy |
 | `REDIS_URL` | Shared rate-limit storage | Must use the `redis://` or `rediss://` scheme. Rate limiting runs on shared Redis, never per-process in-memory, in production |
 | `SMTP_HOST` | Mail server for verification/reset emails | Required, non-empty |
-| `SMTP_PORT` | Mail server port | Required, non-empty |
+| `SMTP_PORT` | Mail server port | Must be an integer between 1 and 65535 (default `587`). Use `587` for STARTTLS or `465` for implicit TLS. |
 | `SMTP_USER` | SMTP account | Required, non-empty |
 | `SMTP_PASSWORD` | SMTP account password | Required, non-empty. Never logged |
 | `APP_BASE_URL` | Base URL used in emailed links | Must start with `https://` — emailed links must use HTTPS |

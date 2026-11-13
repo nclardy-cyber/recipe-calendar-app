@@ -5,6 +5,7 @@ The original db/calendar.db and instance/calendar.db are never touched.
 """
 import importlib
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -45,6 +46,7 @@ try:
     from embedded_postgres import get_server as _get_pg_server
     _HAS_EMBEDDED_PG = True
 except ImportError:
+    _get_pg_server = None
     _HAS_EMBEDDED_PG = False
 
 
@@ -77,17 +79,36 @@ def _alembic_upgrade(database_url: str) -> None:
 
 @pytest.fixture(scope='session')
 def pg_server():
-    """A disposable embedded PostgreSQL server for the whole session."""
+    """A disposable embedded PostgreSQL server for the whole session.
+
+    The server's data directory lives inside a fresh mkdtemp root. On
+    teardown - and on the failure path where the server never started -
+    the whole root is removed so no temporary data survives the run
+    (CMP-006A).
+    """
     if not _HAS_EMBEDDED_PG:
         pytest.skip('embedded_postgres is not installed '
                     '(pip install embedded_postgres)')
-    data_dir = Path(tempfile.mkdtemp(prefix='cmp005c-pg-')) / 'data'
-    server = _get_pg_server(data_dir)
-    yield server
+    assert _get_pg_server is not None  # guaranteed by _HAS_EMBEDDED_PG
+    tmp_root = Path(tempfile.mkdtemp(prefix='cmp006a-pg-'))
+    server = None
     try:
-        server.cleanup()
-    except Exception:
-        pass
+        # cleanup_mode='delete' is the embedded_postgres documented
+        # pattern for temporary servers: the server stops itself and
+        # removes its own data directory when closed.
+        server = _get_pg_server(tmp_root / 'data', cleanup_mode='delete')
+        yield server
+    finally:
+        if server is not None:
+            try:
+                server.cleanup()
+            except Exception:
+                pass
+        # Belt and braces: remove the whole mkdtemp root so nothing
+        # survives - including when the server failed to start (the data
+        # directory may be half-initialised) or cleanup() already removed
+        # it (rmtree of a missing path is a no-op with ignore_errors).
+        shutil.rmtree(tmp_root, ignore_errors=True)
 
 
 @pytest.fixture()
@@ -146,7 +167,9 @@ def app_module(tmp_path, monkeypatch):
     """
     monkeypatch.setenv('DATABASE_URL', _tmp_db_url(tmp_path))
     monkeypatch.setenv('SECRET_KEY', 'unit-test-secret-key')
-    monkeypatch.delenv('FLASK_ENV', raising=False)
+    # Explicit development opt-in (CMP-006A): an unset FLASK_ENV resolves
+    # to PRODUCTION, which would refuse these dev-mode test loads.
+    monkeypatch.setenv('FLASK_ENV', 'development')
     monkeypatch.delenv('FLASK_DEBUG', raising=False)
     mod = reload_app()
     # Flask-Limiter v4 reads `enabled` from the limiter instance (config is

@@ -228,3 +228,48 @@ def test_api_recipe_validation(app_module, client):
     assert client.post('/api/recipes', json={'date': '2026-04-05'}).status_code == 400
     assert client.post('/api/recipes', json={'title': 'X', 'date': 'nope'}).status_code == 400
     assert client.get('/api/recipes?date=garbage').get_json() == {'date': 'garbage', 'recipes': []}
+
+
+# --- PUT title length limit (CMP-006A) ----------------------------------------
+# The recipe title column is String(100). PostgreSQL would reject an over-long
+# title with a database error (500) and SQLite would silently store it - the
+# API must reject it with 400 before it reaches the database.
+
+def test_api_put_title_over_100_chars_rejected(app_module, client):
+    from helpers import make_user, login
+    make_user(app_module, 'putlimit@example.com')
+    login(client, 'putlimit@example.com')
+    recipe_id = client.post('/api/recipes',
+                            json={'title': 'Seed', 'date': '2026-04-05'}
+                            ).get_json()['id']
+    resp = client.put(f'/api/recipes/{recipe_id}',
+                      json={'title': 'x' * 101})
+    assert resp.status_code == 400
+    assert '100 characters' in resp.get_json()['error']
+    # The title on the database is unchanged.
+    assert client.get(f'/api/recipes/{recipe_id}').get_json()['title'] == 'Seed'
+
+
+def test_api_put_title_exactly_100_chars_accepted(app_module, client):
+    from helpers import make_user, login
+    make_user(app_module, 'putlimit100@example.com')
+    login(client, 'putlimit100@example.com')
+    recipe_id = client.post('/api/recipes',
+                            json={'title': 'Seed', 'date': '2026-04-05'}
+                            ).get_json()['id']
+    title = 'y' * 100
+    resp = client.put(f'/api/recipes/{recipe_id}', json={'title': title})
+    assert resp.status_code == 200
+    assert client.get(f'/api/recipes/{recipe_id}').get_json()['title'] == title
+
+
+def test_api_put_blank_title_rejected(app_module, client):
+    from helpers import make_user, login
+    make_user(app_module, 'putblank@example.com')
+    login(client, 'putblank@example.com')
+    recipe_id = client.post('/api/recipes',
+                            json={'title': 'Seed', 'date': '2026-04-05'}
+                            ).get_json()['id']
+    assert client.put(f'/api/recipes/{recipe_id}',
+                      json={'title': '   '}).status_code == 400
+    assert client.get(f'/api/recipes/{recipe_id}').get_json()['title'] == 'Seed'

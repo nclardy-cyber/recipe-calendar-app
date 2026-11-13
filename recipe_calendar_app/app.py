@@ -10,9 +10,9 @@ from flask_login import (LoginManager, UserMixin, current_user, login_user,
                          logout_user, login_required)
 from flask_migrate import Migrate
 from flask_limiter import Limiter
-from flask_limiter.util import get_remote_address
 from flask_wtf.csrf import CSRFProtect
 import click
+import ipaddress
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime, timedelta, date, timezone
 from calendar import monthrange, month_name
@@ -32,14 +32,24 @@ logger = logging.getLogger(__name__)
 # fixed, clearly-marked fallback key is used so local sessions survive
 # restarts.
 DEV_FALLBACK_SECRET_KEY = 'dev-only-insecure-secret-key-change-me'
-_PRODUCTION_ENVS = {'production', 'prod'}
+# Development mode requires an EXPLICIT opt-in (CMP-006A): FLASK_ENV must
+# be 'development' or 'dev'. Everything else - including an UNSET FLASK_ENV,
+# 'production', 'prod', or a typo like 'prodction' - resolves to
+# PRODUCTION, where the fail-safe startup gate below refuses to boot with an
+# incomplete configuration. This makes it impossible for Render (or any host)
+# to silently run the app in development mode with a missing or misspelled
+# FLASK_ENV: an unknown value degrades to the strictest posture, and a
+# strict posture with missing config fails the deploy instead of serving.
+_DEVELOPMENT_ENVS = {'development', 'dev'}
 # Production keys must be at least this long (32 URL-safe chars, as produced
 # by secrets.token_urlsafe(32), is the recommended minimum).
 PRODUCTION_SECRET_KEY_MIN_LENGTH = 32
 
 
 def _is_production() -> bool:
-    return os.environ.get('FLASK_ENV', '').strip().lower() in _PRODUCTION_ENVS
+    """Production unless FLASK_ENV explicitly opts into development."""
+    return os.environ.get('FLASK_ENV', '').strip().lower() not in \
+        _DEVELOPMENT_ENVS
 
 
 def _resolve_secret_key() -> str:
@@ -145,6 +155,35 @@ app.secret_key = _resolve_secret_key()
 # Werkzeug dev server, so the debugger cannot start under it.
 app.debug = os.environ.get('FLASK_DEBUG', '').strip().lower() in {'1', 'true', 'yes'}
 app.config['DEBUG'] = app.debug
+# Fail-safe production readiness backstop (CMP-005C, registration order
+# matters - CMP-006A): registered BEFORE CSRF validation so an unmigrated
+# production instance answers 503 on EVERY non-health route - including
+# mutating requests that carry no CSRF token - instead of a CSRF 400 that
+# would let the readiness state be probed through the error code. The
+# health endpoints themselves are exempt: they report the state. (The
+# helpers it calls are module globals resolved at request time, after the
+# whole module has loaded.)
+@app.before_request
+def _enforce_production_readiness():
+    """Backstop: production serves no application route until ready.
+
+    Defense in depth behind the deploy-time checks: even an instance
+    whose health checks are misconfigured or not yet enabled must not
+    answer application traffic against a fresh or unmigrated database.
+    The health endpoints themselves are exempt - they report the state.
+    """
+    if not _is_production():
+        return None
+    path = request.path
+    if path == '/health' or path.startswith('/health/'):
+        return None
+    ok, reason = _production_readiness()
+    if not ok:
+        logger.warning('rejected %s %s: production not ready (%s)',
+                       request.method, path, reason)
+        return jsonify(_unavailable_body(reason)), 503
+    return None
+
 # CSRF protection for every state-changing request (browser forms AND
 # cookie-authenticated API writes). Tokens are session-bound; forms embed
 # {{ csrf_token() }} and JSON API clients send the X-CSRFToken header.
@@ -199,9 +238,13 @@ if _is_production():
 # warning (no token details) and the request continues.
 app.config['SMTP_HOST'] = os.environ.get('SMTP_HOST', '').strip()
 try:
-    app.config['SMTP_PORT'] = int(os.environ.get('SMTP_PORT', '587') or 587)
+    _smtp_port = int(os.environ.get('SMTP_PORT', '587') or 587)
 except ValueError:
     raise RuntimeError('SMTP_PORT must be an integer (e.g. 587)')
+if not 1 <= _smtp_port <= 65535:
+    raise RuntimeError(
+        f'SMTP_PORT must be a valid TCP port between 1 and 65535 (got {_smtp_port})')
+app.config['SMTP_PORT'] = _smtp_port
 app.config['SMTP_USER'] = os.environ.get('SMTP_USER', '').strip()
 app.config['SMTP_PASSWORD'] = os.environ.get('SMTP_PASSWORD', '')
 app.config['SMTP_FROM'] = os.environ.get(
@@ -472,10 +515,82 @@ def _issue_reset_email(user) -> None:
     )
 
 
+# --- Trusted proxy / client identification (CMP-006A) -----------------------
+# Behind a reverse proxy (Render's load balancer in production) the app's
+# TCP peer (REMOTE_ADDR) is the proxy, not the client. A key function that
+# uses only REMOTE_ADDR would therefore put EVERY client in one shared
+# rate-limit bucket, and a naive "first X-Forwarded-For entry" rule lets a
+# client forge its own identity (and drain other clients' buckets).
+#
+# The resolution below trusts ONLY the proxy hops the deployment topology
+# actually has, and never arbitrary X-Forwarded-For values:
+#
+#   * REMOTE_ADDR is always trustworthy - the kernel verified the TCP peer.
+#   * Each trusted proxy hop appends exactly ONE entry to X-Forwarded-For:
+#     the address it saw. A client can control the entries written upstream
+#     of the trusted suffix, but never the suffix itself, because each of
+#     those entries was written by a verified hop.
+#
+# With N trusted hops the client is the entry just left of the N
+# trusted-written suffix: XFF[-N] when the header carries at least N
+# entries, otherwise REMOTE_ADDR (direct connection or a stripped header).
+# If any entry in the trusted suffix fails IP validation the whole header
+# is treated as untrustworthy and REMOTE_ADDR is used instead.
+#
+# Defaults: production runs behind Render's single load balancer, so N=1;
+# development is a direct connection (no proxy), so N=0 and X-Forwarded-For
+# is never read at all. Other topologies can set TRUSTED_PROXY_HOPS
+# explicitly; an invalid value refuses to start - a broken trust
+# configuration must not silently degrade client identity.
+def _trusted_proxy_hops() -> int:
+    raw = os.environ.get('TRUSTED_PROXY_HOPS')
+    if raw is None or not raw.strip():
+        return 1 if _is_production() else 0
+    try:
+        hops = int(raw.strip())
+    except ValueError:
+        hops = -1
+    if hops < 0:
+        raise RuntimeError(
+            f'TRUSTED_PROXY_HOPS must be a non-negative integer, '
+            f'got {raw!r}'
+        )
+    return hops
+
+
+def _trusted_client_ip() -> str:
+    """Client identity for rate limiting (see the trust notes above).
+
+    This is the Flask-Limiter ``key_func``. It is deliberately conservative:
+    any ambiguity (missing/short header, invalid entry in the trusted
+    suffix) falls back to the kernel-verified REMOTE_ADDR rather than
+    trusting a client-controlled value.
+    """
+    remote = request.remote_addr or 'unknown'
+    hops = _trusted_proxy_hops()
+    if hops == 0:
+        return remote
+    raw = request.headers.get('X-Forwarded-For')
+    if not raw:
+        return remote
+    entries = [e.strip() for e in raw.split(',') if e.strip()]
+    if len(entries) < hops:
+        return remote
+    for entry in entries[-hops:]:
+        try:
+            ipaddress.ip_address(entry)
+        except ValueError:
+            return remote
+    return entries[-hops]
+
+
 # --- Rate limiting -----------------------------------------------------------
-# Per-IP limits on the credential/account endpoints. The in-memory store is
-# per process; behind multiple workers each worker enforces its own copy
-# (limits therefore scale roughly with worker count - see README).
+# Per-client limits on the credential/account endpoints. Client identity
+# comes from _trusted_client_ip() (trusted proxy hops only - see above).
+# The in-memory store is per process; behind multiple workers each worker
+# enforces its own copy (limits therefore scale roughly with worker count
+# in development). In production every worker shares Redis (see below), so
+# the limits hold across workers.
 def _rate_limit_handler(request_limit):
     """Friendly 429 response (Flask-Limiter ``on_breach`` callback).
 
@@ -508,7 +623,7 @@ def _rate_limit_handler(request_limit):
 # server understands (newer redis-py versions default to a HELLO/RESP3
 # handshake that very old servers reject).
 limiter = Limiter(
-    key_func=get_remote_address,
+    key_func=_trusted_client_ip,
     storage_uri=os.environ.get('REDIS_URL', '').strip()
     if _is_production() else 'memory://',
     storage_options={'protocol': 2},
@@ -519,6 +634,12 @@ limiter = Limiter(
     on_breach=_rate_limit_handler,
 )
 limiter.init_app(app)
+
+# Validate the trust configuration at STARTUP: a broken TRUSTED_PROXY_HOPS
+# must fail the deploy (a startup error Render can act on), not every
+# rate-limited request (a 500 storm). In production this runs before the
+# first request is served.
+_trusted_proxy_hops()
 
 
 # Identical user-facing message for every failed login, regardless of which
@@ -600,6 +721,15 @@ def login():
         if _valid_email(email):
             user = db.session.execute(
                 db.select(User).where(User.email == email)).scalar_one_or_none()
+        if user is None:
+            # Equalize timing (anti-enumeration, CMP-006A): an unknown or
+            # malformed email address would otherwise skip the hash check
+            # and return noticeably faster than a known email with a wrong
+            # password. Run a genuine check against a throwaway hash of the
+            # same algorithm/cost so every failed login takes about the same
+            # time. (A dummy hash can never match a real user's stored hash,
+            # so this cannot authenticate anyone.)
+            check_password_hash(DUMMY_PASSWORD_HASH, password)
 
         if user is not None and user.check_password(password):
             if user.status == 'disabled':
@@ -1036,7 +1166,16 @@ def recipe_api(id):
 
     elif request.method == 'PUT':
         data = request.get_json(silent=True) or {}
-        recipe.title = data.get('title', recipe.title)
+        # Enforce the 100-character title limit (CMP-006A): PostgreSQL
+        # would reject an over-long title with a database error (500),
+        # and SQLite would silently store it - both wrong. Reject with
+        # 400 instead, matching the model's String(100) column.
+        new_title = data.get('title', recipe.title)
+        if not isinstance(new_title, str) or not new_title.strip():
+            return {'error': 'title must be a non-empty string'}, 400
+        if len(new_title) > 100:
+            return {'error': 'title must be at most 100 characters'}, 400
+        recipe.title = new_title.strip()
         recipe.image = data.get('image', recipe.image)
         recipe.description = data.get('description', recipe.description)
         if data.get('date'):
@@ -1396,28 +1535,6 @@ def health_ready():
     if not ok:
         return jsonify(_unavailable_body(reason)), 503
     return jsonify({'status': 'ok', 'database': 'ok'}), 200
-
-
-@app.before_request
-def _enforce_production_readiness():
-    """Backstop: production serves no application route until ready.
-
-    Defense in depth behind the deploy-time checks: even an instance
-    whose health checks are misconfigured or not yet enabled must not
-    answer application traffic against a fresh or unmigrated database.
-    The health endpoints themselves are exempt - they report the state.
-    """
-    if not _is_production():
-        return None
-    path = request.path
-    if path == '/health' or path.startswith('/health/'):
-        return None
-    ok, reason = _production_readiness()
-    if not ok:
-        logger.warning('rejected %s %s: production not ready (%s)',
-                       request.method, path, reason)
-        return jsonify(_unavailable_body(reason)), 503
-    return None
 
 
 # --- Safe error handling -----------------------------------------------------

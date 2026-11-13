@@ -179,6 +179,38 @@ def test_login_unknown_email_same_message_as_wrong_password(app_module, client):
     assert get_user(app_module, 'nobody@example.com') is None
 
 
+def test_login_unknown_email_performs_dummy_hash_check(app_module, client, monkeypatch):
+    """Anti-enumeration timing equalization (CMP-006A).
+
+    An unknown email address skips the real user's hash and would otherwise
+    return noticeably faster than a known email with a wrong password,
+    leaking account existence by timing. The login route now runs a genuine
+    check against a throwaway hash of the same algorithm/cost so every
+    failed login costs about the same. This test verifies the mechanism
+    deterministically (recording the hash checks) rather than measuring
+    wall-clock time, which is flaky.
+    """
+    register(client)  # a known account exists, so the contrast is real
+    calls = []
+    real_check = app_module.check_password_hash
+
+    def spy(hash_value, password):
+        calls.append(hash_value)
+        return real_check(hash_value, password)
+
+    monkeypatch.setattr(app_module, 'check_password_hash', spy)
+
+    # Unknown email: exactly one hash check, and it is the dummy hash -
+    # never a real user's stored hash (so it cannot authenticate anyone).
+    login(client, email='ghost-timing@example.com', password='whatever-12345')
+    assert calls, 'no password-hash check ran for an unknown email'
+    assert all(h == app_module.DUMMY_PASSWORD_HASH for h in calls), calls
+
+    # The dummy hash is a real, valid hash that simply matches nothing.
+    assert app_module.DUMMY_PASSWORD_HASH.startswith(('scrypt:', 'pbkdf2:'))
+    assert not real_check(app_module.DUMMY_PASSWORD_HASH, 'whatever-12345')
+
+
 def test_disabled_account_login_is_generic(app_module, client):
     register(client)
     with app_module.app.app_context():

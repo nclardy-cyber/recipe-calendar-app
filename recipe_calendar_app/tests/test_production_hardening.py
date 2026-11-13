@@ -218,7 +218,10 @@ def test_prod_startup_with_full_config_loads(monkeypatch, tmp_path):
 def test_dev_defaults_never_require_production_vars(monkeypatch, tmp_path):
     monkeypatch.setenv('DATABASE_URL', _tmp_db_url(tmp_path))
     monkeypatch.setenv('SECRET_KEY', 'unit-test-secret-key')
-    for var in ('FLASK_ENV', 'FLASK_DEBUG', 'REDIS_URL', 'SMTP_HOST',
+    # Explicit development opt-in (CMP-006A): an unset FLASK_ENV is
+    # PRODUCTION, which would require the production variables below.
+    monkeypatch.setenv('FLASK_ENV', 'development')
+    for var in ('FLASK_DEBUG', 'REDIS_URL', 'SMTP_HOST',
                 'SMTP_USER', 'SMTP_PASSWORD', 'APP_BASE_URL'):
         monkeypatch.delenv(var, raising=False)
     mod = reload_app()
@@ -547,7 +550,8 @@ def _load_app_for_smtp(monkeypatch, tmp_path, smtp_port, base_url,
         d.mkdir(parents=True, exist_ok=True)
         monkeypatch.setenv('DATABASE_URL', _tmp_db_url(d))
         monkeypatch.setenv('SECRET_KEY', 'unit-test-secret-key')
-        monkeypatch.delenv('FLASK_ENV', raising=False)
+        # explicit development opt-in (CMP-006A)
+        monkeypatch.setenv('FLASK_ENV', 'development')
         monkeypatch.delenv('REDIS_URL', raising=False)
     monkeypatch.delenv('FLASK_DEBUG', raising=False)
     monkeypatch.setenv('SMTP_HOST', '127.0.0.1')
@@ -617,7 +621,7 @@ def test_smtp_failure_is_non_fatal(monkeypatch, tmp_path):
     is created) and the response is the generic one."""
     monkeypatch.setenv('DATABASE_URL', _tmp_db_url(tmp_path))
     monkeypatch.setenv('SECRET_KEY', 'unit-test-secret-key')
-    monkeypatch.delenv('FLASK_ENV', raising=False)
+    monkeypatch.setenv('FLASK_ENV', 'development')  # explicit dev opt-in
     monkeypatch.delenv('FLASK_DEBUG', raising=False)
     monkeypatch.delenv('REDIS_URL', raising=False)
     monkeypatch.setenv('SMTP_HOST', '127.0.0.1')
@@ -640,3 +644,83 @@ def test_smtp_failure_is_non_fatal(monkeypatch, tmp_path):
                 mod.User.email == 'fail@example.com')).scalar_one()
     assert user is not None
     assert user.email_verified is False
+
+
+# ---------------------------------------------------------------------------
+# 5. production mode is the SAFE DEFAULT (CMP-006A M3)
+# ---------------------------------------------------------------------------
+# Development requires an explicit opt-in (FLASK_ENV=development/dev).
+# Anything else - unset FLASK_ENV, 'production', 'prod', a typo, a foreign
+# value - resolves to PRODUCTION, where the fail-safe gate refuses to boot
+# with an incomplete configuration. Render can therefore never silently run
+# the app in development mode.
+
+def test_missing_flask_env_resolves_to_production(monkeypatch, tmp_path):
+    """Unset FLASK_ENV + a complete production configuration boots in the
+    strict posture, not in development."""
+    _prod_env(monkeypatch, tmp_path, FLASK_ENV=None)
+    mod = reload_app()
+    assert mod._is_production() is True
+    assert mod.app.config['SESSION_COOKIE_SECURE'] is True
+    assert mod.limiter._storage_uri == 'redis://127.0.0.1:6390/9'
+
+
+def test_missing_flask_env_and_incomplete_config_refuses_startup(
+        monkeypatch, tmp_path):
+    """Unset FLASK_ENV + missing production config = STARTUP FAILURE, not
+    a silent development fallback."""
+    monkeypatch.setenv('SECRET_KEY', 'k' * 40)
+    for var in ('FLASK_ENV', 'FLASK_DEBUG', 'REDIS_URL', 'SMTP_HOST',
+                'SMTP_USER', 'SMTP_PASSWORD', 'APP_BASE_URL',
+                'DATABASE_URL'):
+        monkeypatch.delenv(var, raising=False)
+    with pytest.raises(RuntimeError) as exc:
+        reload_app()
+    assert 'REDIS_URL' in str(exc.value)
+    assert 'DATABASE_URL' in str(exc.value)
+
+
+def test_incorrect_flask_env_value_resolves_to_production(
+        monkeypatch, tmp_path):
+    """A misspelled, mis-cased or foreign FLASK_ENV never switches the app
+    into development."""
+    # typo: with the full production config it boots strict ...
+    _prod_env(monkeypatch, tmp_path, FLASK_ENV='prodction')
+    assert reload_app()._is_production() is True
+    # ... with a casing variant it boots strict ...
+    _prod_env(monkeypatch, tmp_path, FLASK_ENV='Production')
+    assert reload_app()._is_production() is True
+    # ... and a foreign value with incomplete config refuses to start.
+    _prod_env(monkeypatch, tmp_path, FLASK_ENV='staging', REDIS_URL=None)
+    with pytest.raises(RuntimeError, match='REDIS_URL'):
+        reload_app()
+
+
+def test_development_requires_explicit_opt_in(monkeypatch, tmp_path):
+    """Only FLASK_ENV=development/dev runs the development posture:
+    fallback secret key accepted, Secure cookie off, in-memory limiter."""
+    for env in ('development', 'dev'):
+        monkeypatch.setenv('DATABASE_URL', _tmp_db_url(tmp_path))
+        monkeypatch.delenv('SECRET_KEY', raising=False)
+        monkeypatch.setenv('FLASK_ENV', env)
+        for var in ('FLASK_DEBUG', 'REDIS_URL', 'SMTP_HOST',
+                    'SMTP_USER', 'SMTP_PASSWORD', 'APP_BASE_URL'):
+            monkeypatch.delenv(var, raising=False)
+        mod = reload_app()
+        assert mod._is_production() is False
+        assert mod.app.secret_key == mod.DEV_FALLBACK_SECRET_KEY
+        assert mod.app.config['SESSION_COOKIE_SECURE'] is False
+        assert mod.limiter._storage_uri == 'memory://'
+
+
+def test_production_boot_never_creates_local_database(monkeypatch, tmp_path):
+    """Production must never fall back to a local SQLite file: after
+    importing the app in production mode (migration-managed PostgreSQL
+    schema, no create_all()) no new *.db file may appear in the app tree."""
+    import glob
+    pattern = str(APP_DIR / '**' / '*.db')
+    before = set(glob.glob(pattern, recursive=True))
+    _prod_env(monkeypatch, tmp_path)  # DATABASE_URL = postgres (unreachable)
+    reload_app()
+    after = set(glob.glob(pattern, recursive=True))
+    assert after == before, (after - before)
