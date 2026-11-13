@@ -47,8 +47,16 @@ def _prod_env(monkeypatch, tmp_path, **overrides):
     """A complete, valid production environment with per-test overrides.
 
     Pass ``name=None`` in *overrides* to delete a variable.
+
+    The default DATABASE_URL is a PostgreSQL URL that points at nothing
+    (127.0.0.1:1): the production startup gate is import-time only and
+    never contacts the database, so import-only tests stay
+    dependency-free. Tests that exercise the database pass a real
+    disposable PostgreSQL URL (see the pg_database fixture in conftest).
     """
-    monkeypatch.setenv('DATABASE_URL', _tmp_db_url(tmp_path))
+    monkeypatch.setenv(
+        'DATABASE_URL',
+        'postgres://unit-test:***@127.0.0.1:1/cmp005b_import_only')
     monkeypatch.setenv('SECRET_KEY', PROD_KEY)
     monkeypatch.setenv('FLASK_ENV', 'production')
     monkeypatch.delenv('FLASK_DEBUG', raising=False)
@@ -65,16 +73,17 @@ def _prod_env(monkeypatch, tmp_path, **overrides):
             monkeypatch.setenv(key, value)
 
 
-def _load_worker(monkeypatch, tmp_path, name, redis_url,
+def _load_worker(monkeypatch, tmp_path, name, redis_url, pg_url,
                  smtp_port=None, base_url='https://unit-test.example'):
     """Load app.py as an INDEPENDENT module object (its own Flask app,
     limiter and database) - i.e. one "worker" of a multi-worker deployment.
 
     Environment is re-read at load time, so it must be set before the call.
+    Workers share the disposable migrated PostgreSQL database *pg_url*
+    (matching a real deployment, where all workers share one database);
+    each test uses its own email addresses so they never collide.
     """
-    db_dir = tmp_path / name
-    db_dir.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setenv('DATABASE_URL', _tmp_db_url(db_dir))
+    monkeypatch.setenv('DATABASE_URL', pg_url)
     monkeypatch.setenv('SECRET_KEY', PROD_KEY)
     monkeypatch.setenv('FLASK_ENV', 'production')
     monkeypatch.delenv('FLASK_DEBUG', raising=False)
@@ -154,6 +163,23 @@ def test_prod_missing_smtp_credentials_refuse_startup(monkeypatch, tmp_path):
 def test_prod_non_https_app_base_url_refuses_startup(monkeypatch, tmp_path):
     _prod_env(monkeypatch, tmp_path, APP_BASE_URL='http://insecure.example')
     with pytest.raises(RuntimeError, match='APP_BASE_URL'):
+        reload_app()
+
+
+def test_prod_missing_database_url_refuses_startup(monkeypatch, tmp_path):
+    """Production requires an explicit PostgreSQL URL (CMP-005C): an unset
+    DATABASE_URL would silently fall back to a local SQLite file, which a
+    Render service discards on every deploy."""
+    _prod_env(monkeypatch, tmp_path, DATABASE_URL=None)
+    with pytest.raises(RuntimeError, match='DATABASE_URL'):
+        reload_app()
+
+
+def test_prod_sqlite_database_url_refused_in_production(monkeypatch, tmp_path):
+    """SQLite is a development fallback only: production must be pointed
+    at PostgreSQL by an explicit URL (CMP-005C)."""
+    _prod_env(monkeypatch, tmp_path, DATABASE_URL='sqlite:///calendar.db')
+    with pytest.raises(RuntimeError, match='PostgreSQL'):
         reload_app()
 
 
@@ -382,13 +408,14 @@ def redis_instance():
 
 
 def test_redis_signup_limit_shared_across_instances(monkeypatch, tmp_path,
-                                                    redis_instance):
+                                                    redis_instance,
+                                                    pg_database):
     """Two independent app instances sharing one Redis: the 3/hour signup
     limit is global, not per-worker."""
     mod_a = _load_worker(monkeypatch, tmp_path, 'cmp005b_worker_a',
-                         redis_instance.url)
+                         redis_instance.url, pg_database)
     mod_b = _load_worker(monkeypatch, tmp_path, 'cmp005b_worker_b',
-                         redis_instance.url)
+                         redis_instance.url, pg_database)
     c_a = csrf_wrapped(mod_a.app.test_client())
     c_b = csrf_wrapped(mod_b.app.test_client())
 
@@ -409,12 +436,13 @@ def test_redis_signup_limit_shared_across_instances(monkeypatch, tmp_path,
 
 
 def test_redis_login_limit_shared_across_instances(monkeypatch, tmp_path,
-                                                   redis_instance):
+                                                   redis_instance,
+                                                   pg_database):
     """The 5/15-minute login limit is shared across workers."""
     mod_a = _load_worker(monkeypatch, tmp_path, 'cmp005b_login_a',
-                         redis_instance.url)
+                         redis_instance.url, pg_database)
     mod_b = _load_worker(monkeypatch, tmp_path, 'cmp005b_login_b',
-                         redis_instance.url)
+                         redis_instance.url, pg_database)
     c_a = csrf_wrapped(mod_a.app.test_client())
     c_b = csrf_wrapped(mod_b.app.test_client())
 
@@ -429,12 +457,13 @@ def test_redis_login_limit_shared_across_instances(monkeypatch, tmp_path,
     assert resp.status_code == 429
 
 
-def test_redis_outage_fails_closed(monkeypatch, tmp_path, redis_instance):
+def test_redis_outage_fails_closed(monkeypatch, tmp_path, redis_instance,
+                                   pg_database):
     """With Redis unreachable in production, rate-limited endpoints fail
     CLOSED with a 500 (no silent per-worker in-memory fallback), while
     unlimited endpoints keep working."""
     mod = _load_worker(monkeypatch, tmp_path, 'cmp005b_outage',
-                       redis_instance.url)
+                       redis_instance.url, pg_database)
     # make sure a 500 error response (not a re-raised exception) is returned
     mod.app.config['PROPAGATE_EXCEPTIONS'] = False
     c = csrf_wrapped(mod.app.test_client())
@@ -504,18 +533,20 @@ def smtp_server():
 
 
 def _load_app_for_smtp(monkeypatch, tmp_path, smtp_port, base_url,
-                       production=False):
-    d = tmp_path / 'db'
-    d.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setenv('DATABASE_URL', _tmp_db_url(d))
-    monkeypatch.setenv('SECRET_KEY', PROD_KEY if production
-                       else 'unit-test-secret-key')
+                       production=False, pg_url=None):
     if production:
+        # production uses the disposable migrated PostgreSQL *pg_url*
+        monkeypatch.setenv('DATABASE_URL', pg_url)
+        monkeypatch.setenv('SECRET_KEY', PROD_KEY)
         monkeypatch.setenv('FLASK_ENV', 'production')
         # required by the production gate; the limiter is disabled so it is
         # never actually contacted
         monkeypatch.setenv('REDIS_URL', 'redis://127.0.0.1:6390/9')
     else:
+        d = tmp_path / 'db'
+        d.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv('DATABASE_URL', _tmp_db_url(d))
+        monkeypatch.setenv('SECRET_KEY', 'unit-test-secret-key')
         monkeypatch.delenv('FLASK_ENV', raising=False)
         monkeypatch.delenv('REDIS_URL', raising=False)
     monkeypatch.delenv('FLASK_DEBUG', raising=False)
@@ -555,9 +586,10 @@ def test_smtp_delivers_to_configured_server(monkeypatch, tmp_path,
 
 
 def test_smtp_production_uses_https_base_url_and_no_dev_outbox(
-        monkeypatch, tmp_path, smtp_server):
+        monkeypatch, tmp_path, smtp_server, pg_database):
     mod = _load_app_for_smtp(monkeypatch, tmp_path, smtp_server.port,
-                             'https://unit-test.example', production=True)
+                             'https://unit-test.example', production=True,
+                             pg_url=pg_database)
     c = csrf_wrapped(mod.app.test_client())
     c.post('/signup', data={
         'email': 'mail-prod@example.com', 'password': 'password-12345'})

@@ -1,11 +1,11 @@
 """Alembic migration tests against disposable databases.
 
-Every test points Alembic at a fresh throwaway database (SQLite temp
-file, or a disposable PostgreSQL database when CMP_PG_TEST_URL is set).
-The project's real databases (db/calendar.db, instance/calendar.db) are
-never opened.
+Every test points Alembic at a fresh throwaway database (a SQLite temp
+file, or a disposable PostgreSQL database - the session's embedded local
+server, or an external server via CMP_PG_TEST_URL when set). The
+project's real databases (db/calendar.db, instance/calendar.db) are never
+opened.
 """
-import os
 import sqlite3
 
 import pytest
@@ -69,19 +69,92 @@ def _recipe_columns(db_path):
 
 
 def test_upgrade_empty_database(tmp_path):
-    """Truly empty database: user table is created; the (nonexistent)
-    recipe table is left for the app's db.create_all() to create with
-    user_id already present."""
+    """Truly empty database: the user table is created AND the recipe table
+    is created in its full current shape (CMP-005C, migration 0003).
+
+    This is the production contract: `flask db upgrade` alone must produce
+    the complete schema - production never runs the app's db.create_all().
+    """
     db_path = tmp_path / 'fresh.db'
     command.upgrade(_alembic_cfg(db_path), 'head')
 
     tables = _table_names(db_path)
-    assert {'user', 'alembic_version'} <= tables
-    assert 'recipe' not in tables  # never created by the migration
+    assert {'user', 'recipe', 'alembic_version'} <= tables
 
     con = sqlite3.connect(db_path)
     try:
         assert con.execute('SELECT count(*) FROM user').fetchone()[0] == 0
+        assert con.execute('SELECT count(*) FROM recipe').fetchone()[0] == 0
+        # the recipe table has the owner column from the start
+        cols = {r[1] for r in con.execute('PRAGMA table_info(recipe)')}
+        assert {'id', 'title', 'image', 'date', 'description',
+                'user_id'} <= cols
+    finally:
+        con.close()
+
+
+def test_upgrade_empty_database_recipe_matches_model(app_module, tmp_path):
+    """The recipe table created by 0003 on an empty database must match
+    the Recipe model column-for-column (CMP-005C): dev boot via
+    create_all() and production via migrations produce the same schema."""
+    db_path = tmp_path / 'fresh_model.db'
+    command.upgrade(_alembic_cfg(db_path), 'head')
+
+    cols = {r[1] for r in sqlite3.connect(db_path).execute(
+        'PRAGMA table_info(recipe)')}
+    model_cols = set(app_module.Recipe.__table__.columns.keys())
+    assert cols == model_cols, (cols, model_cols)
+
+
+def test_downgrade_from_fresh_upgrade_is_lossless(tmp_path):
+    """Downgrading a database that was created by a full upgrade-from-empty
+    (its recipe table came from 0003) must not lose recipe rows: 0003 only
+    owns the user_id column, which 0001's downgrade drops, while 0001 owns
+    the rest of the table and keeps it (CMP-005C)."""
+    db_path = tmp_path / 'fresh_full.db'
+    cfg = _alembic_cfg(db_path)
+    command.upgrade(cfg, 'head')
+
+    # Representative data: one owned and one unowned recipe.
+    con = sqlite3.connect(db_path)
+    con.execute(
+        "INSERT INTO user (email, password_hash, email_verified, status) "
+        "VALUES ('freshdb@example.com', 'pbkdf2-test-hash', 1, 'active')")
+    uid = con.execute(
+        "SELECT id FROM user WHERE email = 'freshdb@example.com'").fetchone()[0]
+    con.execute(
+        "INSERT INTO recipe (title, date, user_id) "
+        "VALUES ('owned-recipe', '2026-01-05', ?)", (uid,))
+    con.execute(
+        "INSERT INTO recipe (title, date) VALUES ('unowned-recipe', '2026-01-06')")
+    con.commit()
+    con.close()
+
+    command.downgrade(cfg, 'base')
+
+    tables = _table_names(db_path)
+    assert 'user' not in tables
+    assert 'recipe' in tables  # 0003's table survives via 0001's downgrade
+    assert 'user_id' not in _recipe_columns(db_path)
+    # Both rows survive the downgrade; the ownership column is gone, so only
+    # the title can be selected here (user_id reappears, NULL, on re-upgrade).
+    con = sqlite3.connect(db_path)
+    rows = con.execute('SELECT title FROM recipe ORDER BY date').fetchall()
+    assert [r[0] for r in rows] == ['owned-recipe', 'unowned-recipe']
+    con.close()
+
+    # Re-upgrade: full schema back, still at head, both rows unowned.
+    command.upgrade(cfg, 'head')
+    from alembic.script import ScriptDirectory
+    head = ScriptDirectory.from_config(cfg).get_current_head()
+    con = sqlite3.connect(db_path)
+    try:
+        assert con.execute(
+            'SELECT version_num FROM alembic_version').fetchone()[0] == head
+        rows = con.execute(
+            'SELECT title, user_id FROM recipe ORDER BY date').fetchall()
+        assert [r[0] for r in rows] == ['owned-recipe', 'unowned-recipe']
+        assert all(r[1] is None for r in rows)
     finally:
         con.close()
 
@@ -284,18 +357,7 @@ def test_upgrade_status_default_is_quoted_string_literal(tmp_path):
 # --------------------------------------------------------------------------
 
 
-def _pg_admin_url():
-    """Admin PostgreSQL URL for disposable-database regression tests.
-
-    Point CMP_PG_TEST_URL at an admin connection string (it must name an
-    existing database on a server where the role can CREATE DATABASE,
-    e.g. a local throwaway server). When unset the PostgreSQL test is
-    skipped so the default suite stays dependency-free.
-    """
-    return os.environ.get('CMP_PG_TEST_URL')
-
-
-def test_pg_downgrade_reserved_user_table_succeeds():
+def test_pg_downgrade_reserved_user_table_succeeds(pg_admin_url):
     """PostgreSQL downgrade over the reserved ``user`` table (CMP-005A).
 
     0002's downgrade drops its token columns with a raw
@@ -312,10 +374,7 @@ def test_pg_downgrade_reserved_user_table_succeeds():
     covered by ``test_pg_full_migration_chain`` below. A disposable
     database is created and dropped around the test.
     """
-    admin_url = _pg_admin_url()
-    if not admin_url:
-        pytest.skip('CMP_PG_TEST_URL not set (no disposable PostgreSQL server)')
-    assert admin_url is not None  # narrowing only; skip() already bailed
+    admin_url = pg_admin_url
 
     import uuid
 
@@ -416,7 +475,7 @@ def test_pg_downgrade_reserved_user_table_succeeds():
         admin.close()
 
 
-def test_pg_full_migration_chain():
+def test_pg_full_migration_chain(pg_admin_url):
     """Full real migration chain on PostgreSQL (CMP-005A-FIX2).
 
     No stamping and no pre-built schema: 0001's real CREATE TABLE runs
@@ -427,10 +486,7 @@ def test_pg_full_migration_chain():
     with data, mirroring the SQLite tests above. A disposable database
     is created and dropped around the test.
     """
-    admin_url = _pg_admin_url()
-    if not admin_url:
-        pytest.skip('CMP_PG_TEST_URL not set (no disposable PostgreSQL server)')
-    assert admin_url is not None  # narrowing only; skip() already bailed
+    admin_url = pg_admin_url
 
     import uuid
 
@@ -485,7 +541,7 @@ def test_pg_full_migration_chain():
         assert [r[:2] for r in rows] == [
             (r[0], r[1]) for r in LEGACY_ROWS]
         assert all(r[2] is None for r in rows)
-        assert q('SELECT version_num FROM alembic_version') == [('0002',)]
+        assert q('SELECT version_num FROM alembic_version') == [('0003',)]
 
         # Representative data: a user and a recipe owned by that user.
         con = psycopg.connect(url, connect_timeout=10)
@@ -525,7 +581,7 @@ def test_pg_full_migration_chain():
 
         # Re-upgrade: full schema back, every row unowned again.
         command.upgrade(cfg, 'head')
-        assert q('SELECT version_num FROM alembic_version') == [('0002',)]
+        assert q('SELECT version_num FROM alembic_version') == [('0003',)]
         rows = q('SELECT id, user_id FROM recipe ORDER BY id')
         assert len(rows) == len(LEGACY_ROWS) + 1
         assert all(r[1] is None for r in rows)

@@ -5,7 +5,10 @@ The original db/calendar.db and instance/calendar.db are never touched.
 """
 import importlib
 import os
+import subprocess
 import sys
+import tempfile
+import uuid
 from pathlib import Path
 
 import pytest
@@ -27,6 +30,113 @@ def reload_app():
     return app_module
 
 
+# ---------------------------------------------------------------------------
+# Disposable PostgreSQL (embedded_postgres) for production-mode tests
+# ---------------------------------------------------------------------------
+# Production mode requires a real PostgreSQL URL (CMP-005C), so tests that
+# exercise the production app against a database use a disposable embedded
+# PostgreSQL server started once per test session: fresh data directory,
+# 127.0.0.1 only, unique database names, dropped afterwards. No external
+# or production database is ever touched. When the package is not
+# installed the affected tests skip (the rest of the suite stays
+# dependency-free).
+
+try:
+    from embedded_postgres import get_server as _get_pg_server
+    _HAS_EMBEDDED_PG = True
+except ImportError:
+    _HAS_EMBEDDED_PG = False
+
+
+def _alembic_upgrade(database_url: str) -> None:
+    """Run `flask db upgrade` (the documented pre-start procedure) against
+    *database_url* in a subprocess with a production-safe environment.
+    Raises on failure."""
+    env = os.environ.copy()
+    env.update({
+        'DATABASE_URL': database_url,
+        'SECRET_KEY': 'unit-test-prod-key-0123456789abcdef',
+        'FLASK_ENV': 'production',
+        'FLASK_DEBUG': '0',
+        'REDIS_URL': 'redis://127.0.0.1:6390/9',  # never contacted
+        'SMTP_HOST': '127.0.0.1',
+        'SMTP_PORT': '1',
+        'SMTP_USER': 'unit',
+        'SMTP_PASSWORD': 'unit',
+        'APP_BASE_URL': 'https://unit-test.example',
+    })
+    proc = subprocess.run(
+        [sys.executable, '-m', 'flask', 'db', 'upgrade'],
+        cwd=str(APP_DIR), env=env, capture_output=True, text=True,
+        timeout=180)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f'flask db upgrade failed (exit {proc.returncode}):\n'
+            f'{proc.stdout}\n{proc.stderr}')
+
+
+@pytest.fixture(scope='session')
+def pg_server():
+    """A disposable embedded PostgreSQL server for the whole session."""
+    if not _HAS_EMBEDDED_PG:
+        pytest.skip('embedded_postgres is not installed '
+                    '(pip install embedded_postgres)')
+    data_dir = Path(tempfile.mkdtemp(prefix='cmp005c-pg-')) / 'data'
+    server = _get_pg_server(data_dir)
+    yield server
+    try:
+        server.cleanup()
+    except Exception:
+        pass
+
+
+@pytest.fixture()
+def pg_database_raw(pg_server):
+    """A fresh, EMPTY database on the session server (no migrations).
+
+    Yields its postgres:// URL; the database is dropped afterwards.
+    """
+    import psycopg
+    name = f"cmp_{uuid.uuid4().hex[:12]}"
+    admin = psycopg.connect(pg_server.get_uri('postgres'),
+                            connect_timeout=15)
+    admin.autocommit = True
+    admin.execute(f'CREATE DATABASE {name}')
+    admin.close()
+    url = pg_server.get_uri(name)
+    yield url
+    try:
+        admin = psycopg.connect(pg_server.get_uri('postgres'),
+                                connect_timeout=15)
+        admin.autocommit = True
+        admin.execute(f'DROP DATABASE IF EXISTS {name}')
+        admin.close()
+    except Exception:
+        pass
+
+
+@pytest.fixture()
+def pg_database(pg_database_raw):
+    """A fresh, fully-migrated (head) database on the session server."""
+    _alembic_upgrade(pg_database_raw)
+    yield pg_database_raw
+
+
+@pytest.fixture()
+def pg_admin_url(request):
+    """An admin PostgreSQL URL whose role can CREATE/DROP DATABASE.
+
+    Uses the external ``CMP_PG_TEST_URL`` when set, otherwise the
+    session's embedded server's admin database. This lets the PostgreSQL
+    migration regression tests run against a fully disposable server with
+    no external dependency, and skip gracefully when neither is available.
+    """
+    url = os.environ.get('CMP_PG_TEST_URL')
+    if url:
+        return url
+    return request.getfixturevalue('pg_server').get_uri('postgres')
+
+
 @pytest.fixture()
 def app_module(tmp_path, monkeypatch):
     """Fresh app instance backed by a temporary SQLite database.
@@ -46,15 +156,19 @@ def app_module(tmp_path, monkeypatch):
 
 
 @pytest.fixture()
-def prod_app(tmp_path, monkeypatch):
-    """Fresh app instance in PRODUCTION mode (its own temp database).
+def prod_app(pg_database, monkeypatch):
+    """Fresh app instance in PRODUCTION mode against a disposable,
+    fully-migrated PostgreSQL database (CMP-005C: production requires a
+    real PostgreSQL URL and a migration-managed schema - no SQLite
+    fallback, no create_all()).
 
     Supplies the full production environment (strong SECRET_KEY, REDIS_URL,
     SMTP credentials, HTTPS APP_BASE_URL) so the production startup gate
     passes. The limiter is disabled on this fixture, so REDIS_URL/SMTP are
-    never actually contacted by the tests that use it.
+    never actually contacted by the tests that use it. Skips when no
+    disposable PostgreSQL is available.
     """
-    monkeypatch.setenv('DATABASE_URL', _tmp_db_url(tmp_path))
+    monkeypatch.setenv('DATABASE_URL', pg_database)
     monkeypatch.setenv('SECRET_KEY', 'unit-test-production-secret-key-0123456789')
     monkeypatch.setenv('FLASK_ENV', 'production')
     monkeypatch.delenv('FLASK_DEBUG', raising=False)

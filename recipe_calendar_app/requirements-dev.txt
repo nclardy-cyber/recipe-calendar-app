@@ -1,3 +1,7 @@
 # Development/test dependencies (not needed at runtime)
 pytest==8.3.5
 aiosmtpd==1.4.6
+# PostgreSQL verification (disposable embedded server + driver). The PG
+# regression tests skip gracefully when these are not installed.
+embedded-postgres==18.6.3
+psycopg==3.3.9

@@ -3,8 +3,8 @@ Flask Calendar Web App
 Simple calendar view with month navigation
 """
 
-from flask import (Flask, Response, render_template, request, redirect,
-                   url_for, session, flash, abort)
+from flask import (Flask, Response, jsonify, render_template, request,
+                   redirect, url_for, session, flash, abort)
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import (LoginManager, UserMixin, current_user, login_user,
                          logout_user, login_required)
@@ -21,6 +21,7 @@ import logging
 import os
 import re
 import secrets
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +81,11 @@ def _validate_production_environment() -> None:
     * SMTP_HOST / SMTP_USER / SMTP_PASSWORD
                       - required; account emails must be deliverable.
     * APP_BASE_URL    - must be https://; emailed links must use HTTPS.
+    * DATABASE_URL    - required; must be a PostgreSQL URL. An unset
+                        value would silently fall back to a local SQLite
+                        file, and on Render the service filesystem is
+                        ephemeral, so that data would be discarded on
+                        every deploy (CMP-005C).
 
     (SECRET_KEY presence/strength is checked first, in _resolve_secret_key.)
     Development is intentionally lax: none of these are required.
@@ -104,6 +110,25 @@ def _validate_production_environment() -> None:
         problems.append(
             'APP_BASE_URL must be an https:// URL in production (emailed '
             'verification and reset links must use HTTPS)'
+        )
+
+    # DATABASE_URL: production must be pointed at PostgreSQL by an
+    # explicit URL. Accept the plain schemes (rewritten to the psycopg
+    # dialect below) and the SQLAlchemy psycopg URL directly.
+    db_url = os.environ.get('DATABASE_URL', '').strip()
+    if not db_url:
+        problems.append(
+            'DATABASE_URL is required in production (a PostgreSQL URL, '
+            'e.g. postgres://user:pass@host:5432/dbname); an unset '
+            'value would silently fall back to a local SQLite file, '
+            'which a Render service discards on every deploy'
+        )
+    elif not db_url.lower().startswith(('postgres://', 'postgresql://',
+                                        'postgresql+psycopg://')):
+        problems.append(
+            'DATABASE_URL must be a PostgreSQL URL in production '
+            '(postgres://, postgresql:// or postgresql+psycopg://); '
+            'SQLite is a development fallback only'
         )
 
     if problems:
@@ -740,13 +765,33 @@ def reset_password_complete(token):
     return render_template('reset_complete.html', token=token)
 
 
-# Initialize database (idempotent, safe on every boot)
-try:
-    with app.app_context():
-        db.create_all()
-        print("Database initialized!")
-except Exception as _db_exc:  # don't block boot if DB is briefly unavailable
-    print(f"WARNING: could not initialize database: {_db_exc}")
+# Initialize the database.
+#
+# Development: db.create_all() keeps a fresh local database usable
+# without running migrations first (existing tables are never altered;
+# migration 0003 makes an Alembic-migrated database converge to the
+# same shape, so both paths agree).
+#
+# Production (CMP-005C): NO create_all() and NO database contact at
+# import time. The production schema is owned by the Alembic chain and
+# is applied by the explicit pre-start step (`flask db upgrade` - see
+# README "Render deployment"). Running create_all() here would silently
+# bypass migrations: on a fresh database it would create a schema with
+# no alembic_version row, which the readiness checks below correctly
+# refuse to serve. An unreachable or unmigrated database must surface
+# as a failed health check / 503, never as a silent fallback or a
+# divergent schema.
+if _is_production():
+    logger.info(
+        'production startup: schema is migration-managed - run '
+        '"flask db upgrade" before starting the service')
+else:
+    try:
+        with app.app_context():
+            db.create_all()
+            logger.info('local database initialized')
+    except Exception as _db_exc:  # don't block boot if DB is briefly unavailable
+        logger.warning('could not initialize local database: %s', _db_exc)
 
 # Sample recipes (can be removed or customized)  # Disabled for now
 # sample_recipes = [
@@ -1211,6 +1256,168 @@ def search():
 
     return render_template('search.html', query=query, source=source, results=results)
 
+
+
+# --- Health checks & production readiness (CMP-005C) ------------------------
+# /health       liveness: the process is up. Never touches the database.
+# /health/ready readiness: safe to serve traffic. Development - database
+#               reachable; production - database reachable AND schema at
+#               the migration head.
+#
+# Render's HTTP health check points at /health/ready: a deploy whose
+# instances never report ready is cancelled and the previous version
+# keeps serving (zero-downtime guarantee). Failure bodies are coarse on
+# purpose - no connection strings, no exception text, no schema details.
+
+_MIGRATIONS_DIR = Path(__file__).resolve().parent / 'migrations'
+_ALEMBIC_INI = Path(__file__).resolve().parent / 'alembic.ini'
+_prod_readiness = {'verified': False}
+_dev_db_ok = {'verified': False}
+
+
+def _chain_head_revision():
+    """Head revision of the committed migration chain."""
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+    cfg = Config(str(_ALEMBIC_INI))
+    cfg.set_main_option('script_location', str(_MIGRATIONS_DIR))
+    return ScriptDirectory.from_config(cfg).get_current_head()
+
+
+def _production_readiness():
+    """(ok, reason) with reason in {'ok', 'unreachable', 'unmigrated'}.
+
+    Production only. Verifies the database is reachable and that its
+    alembic_version matches the committed migration chain head. Success
+    is cached for the life of the process; failures are re-checked on
+    the next probe so a recovered database clears the instance without
+    a restart. Exceptions never reach the response body: only the
+    exception TYPE name is logged server-side.
+    """
+    if _prod_readiness['verified']:
+        return True, 'ok'
+    uri = app.config['SQLALCHEMY_DATABASE_URI']
+    engine_kwargs = {'pool_pre_ping': True, 'pool_recycle': 1800}
+    if uri.startswith('postgresql'):
+        engine_kwargs['connect_args'] = {'connect_timeout': 5}
+    try:
+        from sqlalchemy import create_engine, text
+        engine = create_engine(uri, **engine_kwargs)
+        try:
+            with engine.connect() as conn:
+                conn.execute(text('SELECT 1'))
+                has_table = conn.execute(
+                    text(
+                        "SELECT 1 FROM information_schema.tables "
+                        "WHERE table_name = 'alembic_version'"
+                    )).first()
+                if not has_table:
+                    return False, 'unmigrated'
+                row = conn.execute(
+                    text('SELECT version_num FROM alembic_version')).first()
+        finally:
+            engine.dispose()
+    except Exception as exc:
+        logger.warning('production readiness: database unreachable: %s',
+                       exc.__class__.__name__)
+        return False, 'unreachable'
+    try:
+        head = _chain_head_revision()
+    except Exception as exc:
+        logger.warning('production readiness: cannot read migration chain: %s',
+                       exc.__class__.__name__)
+        return False, 'unmigrated'
+    if row is not None and row[0] == head:
+        _prod_readiness['verified'] = True
+        logger.info('production readiness: database at migration head %s',
+                    head)
+        return True, 'ok'
+    logger.warning('production readiness: schema is not at migration head %s',
+                   head)
+    return False, 'unmigrated'
+
+
+def _dev_database_reachable():
+    """(ok, reason) for development: the configured database answers."""
+    if _dev_db_ok['verified']:
+        return True, 'ok'
+    uri = app.config['SQLALCHEMY_DATABASE_URI']
+    try:
+        from sqlalchemy import create_engine, text
+        engine = create_engine(uri, pool_pre_ping=True, pool_recycle=1800)
+        try:
+            with engine.connect() as conn:
+                conn.execute(text('SELECT 1'))
+        finally:
+            engine.dispose()
+    except Exception as exc:
+        logger.warning('development health: database unreachable: %s',
+                       exc.__class__.__name__)
+        return False, 'unreachable'
+    _dev_db_ok['verified'] = True
+    return True, 'ok'
+
+
+def _unavailable_body(reason):
+    body = {'status': 'unavailable'}
+    if reason == 'unmigrated':
+        body['schema'] = 'not ready'
+    else:
+        body['database'] = 'unavailable'
+    return body
+
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Liveness probe: the process is up and answering.
+
+    Never touches the database and never exposes configuration, so it
+    stays a pure process-health signal (Render's default TCP probe and
+    any operator liveness check can use it).
+    """
+    return jsonify({'status': 'ok'}), 200
+
+
+@app.route('/health/ready', methods=['GET'])
+def health_ready():
+    """Readiness probe: is this instance safe to route traffic to?
+
+    Development: database reachable.
+    Production: database reachable AND schema at the migration head -
+    a fresh or partially migrated database fails the check so Render
+    cancels the deploy instead of routing traffic to it.
+    """
+    if _is_production():
+        ok, reason = _production_readiness()
+        if not ok:
+            return jsonify(_unavailable_body(reason)), 503
+        return jsonify({'status': 'ok', 'database': 'ok', 'schema': 'ok'}), 200
+    ok, reason = _dev_database_reachable()
+    if not ok:
+        return jsonify(_unavailable_body(reason)), 503
+    return jsonify({'status': 'ok', 'database': 'ok'}), 200
+
+
+@app.before_request
+def _enforce_production_readiness():
+    """Backstop: production serves no application route until ready.
+
+    Defense in depth behind the deploy-time checks: even an instance
+    whose health checks are misconfigured or not yet enabled must not
+    answer application traffic against a fresh or unmigrated database.
+    The health endpoints themselves are exempt - they report the state.
+    """
+    if not _is_production():
+        return None
+    path = request.path
+    if path == '/health' or path.startswith('/health/'):
+        return None
+    ok, reason = _production_readiness()
+    if not ok:
+        logger.warning('rejected %s %s: production not ready (%s)',
+                       request.method, path, reason)
+        return jsonify(_unavailable_body(reason)), 503
+    return None
 
 
 # --- Safe error handling -----------------------------------------------------
